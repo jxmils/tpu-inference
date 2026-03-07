@@ -276,13 +276,18 @@ class TPUWorker(WorkerBase):
         self.model_runner = TPUModelRunner(self.vllm_config, self.devices,
                                            self.rank, is_first_rank,
                                            is_last_rank)
+        try:
+            hbm_str = f"{utils.hbm_usage_gb(self.devices)}GiB"
+        except Exception as e:
+            hbm_str = f"unavailable ({type(e).__name__}: {e})"
+
         logger.info(f"Init worker | "
                     f"rank={self.rank} | "
                     f"is_first_rank={is_first_rank} | "
                     f"is_last_rank={is_last_rank} | "
                     f"topology_order_id={self.topology_order_id} | "
                     f"is_driver_worker={self.is_driver_worker} | "
-                    f"hbm={utils.hbm_usage_gb(self.devices)}GiB |"
+                    f"hbm={hbm_str} | "
                     f"self.devices={self.devices} | "
                     f"total devices={jax.devices()} | "
                     f"local_devices={jax.local_devices()}")
@@ -297,6 +302,14 @@ class TPUWorker(WorkerBase):
     def determine_available_memory(self) -> int:
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
         hbm_usage = utils.hbm_usage_bytes(self.devices)
+
+        if not hbm_usage:
+            raise RuntimeError(
+                "Could not query HBM usage from any addressable TPU device. "
+                "This usually means the worker is seeing non-addressable PJRT devices "
+                "in a multi-host setup."
+            )
+
         total_hbm_limit = total_hbm_used = 0
         for used, limit in hbm_usage:
             total_hbm_used += used

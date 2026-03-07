@@ -86,35 +86,23 @@ def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
         return tp_size
 
 
-def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
+def hbm_usage_bytes(devices):
     usage = []
-    if vllm_envs.VLLM_TPU_USING_PATHWAYS:
-        return pathways_hbm_usage_gb(devices)
+    for device in devices:
+        try:
+            stats = device.memory_stats()
+            if stats is None:
+                continue
 
-    multihost_backend = envs.TPU_MULTIHOST_BACKEND
-    if multihost_backend == "ray":
-        # MemoryStats is only supported for addressable PjRt devices.
-        # Assume all the devices have similar memory usage for now.
-        # TODO(ranlihao): find a proper way to get the memory usage of each device.
-        for device in devices:
-            try:
-                hbm_used = device.memory_stats()["bytes_in_use"]
-                hbm_limit = device.memory_stats()["bytes_limit"]
-                logger.info(
-                    "Get memory stats for device %s. Assuming all devices have the same usage.",
-                    device)
-                usage.extend([(hbm_used, hbm_limit)] * len(devices))
-                break
-            except Exception as e:
-                logger.warning(
-                    "Failed to get memory stats for device %s: %s. ", device,
-                    e)
-    else:
-        for device in devices:
-            hbm_used = device.memory_stats()["bytes_in_use"]
-            hbm_limit = device.memory_stats()["bytes_limit"]
-            usage.append((hbm_used, hbm_limit))
+            used = stats.get("bytes_in_use")
+            limit = stats.get("bytes_limit")
+            if used is None or limit is None:
+                continue
 
+            usage.append((used, limit))
+        except Exception:
+            # Non-addressable PJRT devices on multi-host TP can fail here.
+            continue
     return usage
 
 
@@ -177,11 +165,12 @@ def pathways_hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
     return [(hbm_used[device], hbm_limit) for device in devices]
 
 
-def hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
+def hbm_usage_gb(devices):
     usage = hbm_usage_bytes(devices)
-    usage = [(round(used / GBYTES, 2), round(limit / GBYTES, 2))
-             for used, limit in usage]
-    return usage
+    if not usage:
+        return []
+    return [(round(used / GBYTES, 2), round(limit / GBYTES, 2))
+            for used, limit in usage]
 
 
 def get_padded_head_dim(head_dim: int) -> int:
