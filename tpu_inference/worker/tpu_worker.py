@@ -230,10 +230,16 @@ class TPUWorker(WorkerBase):
                     self.devices = jax.local_devices()[:sharding_config.
                                                        total_devices]
                 else:
-                    # In a multi-host distributed env, say: Ray, local_device count may smaller
-                    # than the total devices, we just choose the smaller set here.
-                    self.devices = jax.devices()[:sharding_config.
-                                                 total_devices]
+                    # Only use global jax.devices() when a real multihost backend has been
+                    # initialized. Otherwise each worker must stay on its addressable local devices.
+                    if multihost_backend == "ray":
+                        self.devices = jax.devices()[:sharding_config.total_devices]
+                    else:
+                        assert jax.local_device_count() >= sharding_config.total_devices, (
+                            f"Requested {sharding_config.total_devices} devices, but only "
+                            f"{jax.local_device_count()} local devices are addressable on this worker."
+                        )
+                        self.devices = jax.local_devices()[:sharding_config.total_devices]
 
         # Initialize the vLLM distribution layer as a single chip environment,
         # we'll swap the model's parallel modules with TPU SPMD equivalents.
