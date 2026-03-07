@@ -80,11 +80,18 @@ class Router(nnx.Module):
     moe_backend: MoEBackend = MoEBackend.DENSE_MAT
     mesh: Optional[jax.sharding.Mesh] = None
 
-    def __call__(self, x_TD: Float):
+    def __call__(self,
+                 x_TD: Float,
+                 *,
+                 capture_routing_stats: bool = False,
+                 layer_idx: int | None = None):
         """Routes tokens to experts.
 
         Args:
             x_TD: Input array of shape (sequence_length, d_model).
+            capture_routing_stats: If True, returns routing stats alongside
+                the MoE output.
+            layer_idx: Optional layer index for routing stats.
 
         Returns:
             A tuple containing:
@@ -177,9 +184,18 @@ class JaxMoE(JaxModule):
             x_TD: Input array of shape (sequence_length, d_model).
 
         Returns:
-            Output array of shape (sequence_length, d_model) after passing through MoE.
+            Output array of shape (sequence_length, d_model) after passing
+            through MoE. If capture_routing_stats=True, returns a tuple
+            (output, routing_stats).
         """
         if self.quant_method is not None:
+            if capture_routing_stats:
+                return self.quant_method.apply_jax(
+                    self,
+                    x_TD,
+                    capture_routing_stats=True,
+                    layer_idx=layer_idx,
+                )
             return self.quant_method.apply_jax(self, x_TD)
         raise ValueError("Expected quant_method to be set!")
 

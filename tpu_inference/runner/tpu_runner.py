@@ -72,6 +72,8 @@ from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 from tpu_inference.runner.lora_utils import LoraUtils
 from tpu_inference.runner.multimodal_manager import MultiModalManager
+from tpu_inference.runner.moe_routing_trace import (RoutingTraceBatchMeta,
+                                                    RoutingTraceWriter)
 from tpu_inference.runner.persistent_batch_manager import \
     PersistentBatchManager
 from tpu_inference.runner.speculative_decoding_manager import (
@@ -153,6 +155,7 @@ class ExecuteModelState:
     aux_hidden_states: Optional[jax.Array]
     spec_decode_metadata: Optional[SpecDecodeMetadata]
     kv_connector_output: Optional[KVConnectorOutput]
+    routing_stats: Optional[object] = None
     logits_indices_selector: Optional[List[int]] = None
     padded_num_reqs: Optional[int] = None
 
@@ -254,6 +257,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._init_mm()
         self._init_inputs()
         self._init_speculative_decoding()
+        self._init_routing_trace()
 
         # Delegate functions to specific manager classes.
         self.compilation_manager = CompilationManager(self)
@@ -282,6 +286,46 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.is_pooling_model: bool = self.model_config.runner_type == "pooling"
         """Generative model or pooling model select different computations."""
+
+    def _init_routing_trace(self) -> None:
+        self._routing_trace_writer: RoutingTraceWriter | None = None
+        self._routing_trace_batch_meta: RoutingTraceBatchMeta | None = None
+        self._routing_trace_step: int = 0
+        if envs.CAPTURE_MOE_ROUTING_STATS and envs.MOE_ROUTING_STATS_DIR:
+            self._routing_trace_writer = RoutingTraceWriter(
+                envs.MOE_ROUTING_STATS_DIR,
+                save_raw=envs.MOE_ROUTING_STATS_SAVE_RAW,
+                save_summary=envs.MOE_ROUTING_STATS_SAVE_SUMMARY,
+            )
+
+    def _persist_routing_stats(self, routing_stats: object,
+                               scheduler_output: "VllmSchedulerOutput") -> None:
+        if self._routing_trace_writer is None:
+            return
+        if routing_stats is None or self._routing_trace_batch_meta is None:
+            return
+        request_seq_ids: Dict[str, Any] = {}
+        for req_id in self.input_batch.req_ids[:self.input_batch.num_reqs]:
+            if req_id is None:
+                continue
+            req_state = self.requests.get(req_id)
+            seq_id = None
+            if req_state is not None:
+                seq_id = getattr(req_state, "seq_id", None)
+                if seq_id is None:
+                    seq_id = getattr(req_state, "request_id", None)
+            request_seq_ids[req_id] = seq_id if seq_id is not None else req_id
+
+        self._routing_trace_writer.write(
+            routing_stats,
+            self._routing_trace_batch_meta,
+            trace_step=self._routing_trace_step,
+            batch_id=self._routing_trace_step,
+            rank=self.rank,
+            request_seq_ids=request_seq_ids,
+            phase_override=None,
+        )
+        self._routing_trace_step += 1
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -811,6 +855,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      self.is_first_rank,
                      self.is_last_rank,
                  )
+            routing_stats = None
+            if isinstance(aux_hidden_states, tuple) and len(
+                    aux_hidden_states) == 2:
+                aux_hidden_states, routing_stats = aux_hidden_states
+            if routing_stats is not None:
+                self._persist_routing_stats(routing_stats, scheduler_output)
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
@@ -851,6 +901,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             logits=logits,
             aux_hidden_states=aux_hidden_states,
+            routing_stats=routing_stats,
             spec_decode_metadata=spec_decode_metadata,
             kv_connector_output=kv_connector_output,
             logits_indices_selector=logits_indices_selector,
@@ -1288,6 +1339,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                  req_ids_dp, scheduled_tokens_per_dp_rank,
                  padded_num_scheduled_tokens_per_dp_rank, dp_size)
 
+        token_req_indices_full = None
+        token_positions_full = None
+        token_mask_full = None
+        if self._routing_trace_writer is not None:
+            token_req_indices_full = np.full(
+                (padded_total_num_scheduled_tokens, ),
+                -1,
+                dtype=np.int32)
+            token_positions_full = np.full(
+                (padded_total_num_scheduled_tokens, ),
+                -1,
+                dtype=np.int32)
+            token_mask_full = np.zeros((padded_total_num_scheduled_tokens, ),
+                                       dtype=np.bool_)
+
         # Populates input_ids and positions
         for dp_rank in range(dp_size):
             if num_req_per_dp_rank[dp_rank] == 0:
@@ -1320,6 +1386,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 arange,
                 out=positions_np,
             )
+            if token_req_indices_full is not None:
+                token_req_indices_full[token_offset:token_offset +
+                                       total_num_scheduled_tokens] = req_indices
+                token_positions_full[token_offset:token_offset +
+                                     total_num_scheduled_tokens] = positions_np
+                token_mask_full[token_offset:token_offset +
+                                total_num_scheduled_tokens] = True
             # Get token indices.
             # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
             # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
@@ -1382,6 +1455,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices_cpu[_num_reqs:] = -1
 
         logits_indices = self.logits_indices_cpu[:padded_num_reqs]
+
+        if self._routing_trace_writer is not None:
+            num_scheduled_tokens_per_req = []
+            for req_id in self.input_batch.req_ids[:num_reqs]:
+                assert req_id is not None
+                num_scheduled_tokens_per_req.append(
+                    scheduler_output.num_scheduled_tokens[req_id])
+            self._routing_trace_batch_meta = RoutingTraceBatchMeta(
+                req_ids=list(self.input_batch.req_ids[:num_reqs]),
+                token_req_indices=token_req_indices_full,
+                token_positions=token_positions_full,
+                token_mask=token_mask_full,
+                num_scheduled_tokens_per_req=np.array(
+                    num_scheduled_tokens_per_req, dtype=np.int32),
+                num_prompt_tokens=self.input_batch.
+                num_prompt_tokens[:num_reqs].copy(),
+                num_computed_tokens=self.input_batch.
+                num_computed_tokens_cpu[:num_reqs].copy(),
+            )
 
         # Please see runner_utils.PhasedBasedProfiler for details
         if self.phase_based_profiler:
@@ -1592,6 +1684,32 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                arange,
                out=positions_np)
+
+        if self._routing_trace_writer is not None:
+            padded_total = runner_utils.get_padded_token_len(
+                self.num_tokens_paddings, total_num_scheduled_tokens)
+            token_req_indices = np.full((padded_total, ),
+                                        -1,
+                                        dtype=np.int32)
+            token_positions = np.full((padded_total, ),
+                                      -1,
+                                      dtype=np.int32)
+            token_mask = np.zeros((padded_total, ), dtype=np.bool_)
+            token_req_indices[:total_num_scheduled_tokens] = req_indices
+            token_positions[:total_num_scheduled_tokens] = positions_np
+            token_mask[:total_num_scheduled_tokens] = True
+            self._routing_trace_batch_meta = RoutingTraceBatchMeta(
+                req_ids=list(self.input_batch.req_ids[:num_reqs]),
+                token_req_indices=token_req_indices,
+                token_positions=token_positions,
+                token_mask=token_mask,
+                num_scheduled_tokens_per_req=num_scheduled_tokens_per_req.copy(
+                ),
+                num_prompt_tokens=self.input_batch.
+                num_prompt_tokens[:num_reqs].copy(),
+                num_computed_tokens=self.input_batch.
+                num_computed_tokens_cpu[:num_reqs].copy(),
+            )
 
         # Multi-modal support
         # Calculate M-RoPE positions.

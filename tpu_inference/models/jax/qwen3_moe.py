@@ -35,6 +35,7 @@ from jax.sharding import PartitionSpec as P
 from transformers import Qwen3Config
 from vllm.config import VllmConfig
 
+from tpu_inference import envs
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -56,6 +57,31 @@ from tpu_inference.models.jax.utils.weight_utils import LoadableWithIterator
 logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
+
+
+def _aggregate_routing_stats(
+        per_layer_stats: List[dict | None]) -> dict:
+    present = [stats for stats in per_layer_stats if stats is not None]
+    if not present:
+        return {}
+    total_expert_counts = sum(stats["expert_counts"] for stats in present)
+    total_unique_token_counts = sum(
+        stats["unique_token_counts"] for stats in present)
+    total_dispatch_bytes = sum(stats["estimated_dispatch_bytes"]
+                               for stats in present)
+    total_return_bytes = sum(stats["estimated_return_bytes"]
+                             for stats in present)
+    return {
+        "num_layers": jnp.asarray(len(present), dtype=jnp.int32),
+        "num_experts": present[0]["num_experts"],
+        "k": present[0]["k"],
+        "expert_counts": total_expert_counts,
+        "unique_token_counts": total_unique_token_counts,
+        "estimated_dispatch_bytes": total_dispatch_bytes,
+        "estimated_return_bytes": total_return_bytes,
+        "estimated_dispatch_bytes_total": jnp.sum(total_dispatch_bytes),
+        "estimated_return_bytes_total": jnp.sum(total_return_bytes),
+    }
 
 
 class Qwen3MoeSparseMoeBlock(JaxModule):
@@ -118,7 +144,18 @@ class Qwen3MoeSparseMoeBlock(JaxModule):
             quant_config=quant_config,
             prefix=prefix + ".experts")
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self,
+                 x: jax.Array,
+                 *,
+                 layer_idx: int | None = None) -> jax.Array | tuple[jax.Array,
+                                                                   dict]:
+        if envs.CAPTURE_MOE_ROUTING_STATS:
+            out, routing_stats = self.experts(x,
+                                              capture_routing_stats=True,
+                                              layer_idx=layer_idx)
+            if self.shared_expert is not None:
+                out += self.shared_expert(x)
+            return out, routing_stats
         out = self.experts(x)
         if self.shared_expert is not None:
             out += self.shared_expert(x)
@@ -167,6 +204,7 @@ class Qwen3MoeDecoderLayer(JaxModule):
             quant_config=quant_config,
             prefix=prefix + ".post_attention_layernorm",
         )
+        self.layer_idx = layer_idx
 
         mlp_only_layers = getattr(config, "mlp_only_layers", [])
         if (layer_idx not in mlp_only_layers) and (
@@ -186,7 +224,7 @@ class Qwen3MoeDecoderLayer(JaxModule):
         kv_cache: jax.Array,
         x: jax.Array,
         attention_metadata: AttentionMetadata,
-    ) -> Tuple[jax.Array, jax.Array]:
+    ) -> Tuple[jax.Array, jax.Array] | Tuple[jax.Array, jax.Array, dict]:
         hidden_states = self.input_layernorm(x)
         kv_cache, attn_output = self.self_attn(
             kv_cache,
@@ -197,8 +235,14 @@ class Qwen3MoeDecoderLayer(JaxModule):
 
         residual = attn_output
         attn_output = self.post_attention_layernorm(attn_output)
-        outputs = self.mlp(attn_output)
+        if envs.CAPTURE_MOE_ROUTING_STATS:
+            outputs, routing_stats = self.mlp(attn_output,
+                                              layer_idx=self.layer_idx)
+        else:
+            outputs = self.mlp(attn_output)
         outputs = residual + outputs
+        if envs.CAPTURE_MOE_ROUTING_STATS:
+            return kv_cache, outputs, routing_stats
         return kv_cache, outputs
 
 
@@ -266,7 +310,8 @@ class Qwen3MoeModel(JaxModule):
         input_ids: jax.Array,
         attention_metadata: AttentionMetadata,
         inputs_embeds: Optional[jax.Array] = None,
-    ) -> Tuple[List[jax.Array], jax.Array]:
+    ) -> Tuple[List[jax.Array], jax.Array] | Tuple[List[jax.Array], jax.Array,
+                                                   dict]:
         if self.is_first_rank:
             assert inputs_embeds is None
             inputs_embeds = self.embed_tokens(input_ids)
@@ -275,17 +320,30 @@ class Qwen3MoeModel(JaxModule):
 
         x = inputs_embeds
         new_kv_caches = []
+        routing_stats = [] if envs.CAPTURE_MOE_ROUTING_STATS else None
         for i, layer in enumerate(self.layers):
             if isinstance(layer, PPMissingLayer):
                 new_kv_caches.append(kv_caches[i])
+                if routing_stats is not None:
+                    routing_stats.append(None)
                 continue
             kv_cache = kv_caches[i]
-            kv_cache, x = layer(kv_cache, x, attention_metadata)
+            if envs.CAPTURE_MOE_ROUTING_STATS:
+                kv_cache, x, layer_stats = layer(kv_cache, x,
+                                                 attention_metadata)
+                routing_stats.append(layer_stats)
+            else:
+                kv_cache, x = layer(kv_cache, x, attention_metadata)
             new_kv_caches.append(kv_cache)
 
         if self.is_last_rank:
             x = self.norm(x)
 
+        if envs.CAPTURE_MOE_ROUTING_STATS:
+            return new_kv_caches, x, {
+                "per_layer": routing_stats,
+                "aggregate": _aggregate_routing_stats(routing_stats),
+            }
         return new_kv_caches, x
 
 
@@ -348,14 +406,24 @@ class Qwen3MoeForCausalLM(JaxModule, LoadableWithIterator):
         if not is_first_rank:
             assert intermediate_tensors is not None
             inputs_embeds = intermediate_tensors["hidden_states"]
-        kv_caches, x = self.model(
-            kv_caches,
-            input_ids,
-            attention_metadata,
-            inputs_embeds,
-        )
+        if envs.CAPTURE_MOE_ROUTING_STATS:
+            kv_caches, x, routing_stats = self.model(
+                kv_caches,
+                input_ids,
+                attention_metadata,
+                inputs_embeds,
+            )
+        else:
+            kv_caches, x = self.model(
+                kv_caches,
+                input_ids,
+                attention_metadata,
+                inputs_embeds,
+            )
         if not is_last_rank:
             x = JaxIntermediateTensors(tensors={"hidden_states": x}, )
+        if envs.CAPTURE_MOE_ROUTING_STATS:
+            return kv_caches, x, ([], routing_stats)
         return kv_caches, x, []
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:

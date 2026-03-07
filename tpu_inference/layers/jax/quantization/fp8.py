@@ -32,6 +32,7 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_fp8_moe_weights)
 from tpu_inference.layers.common.quantization import fp8 as common_fp8
 from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context
+from tpu_inference import envs
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.base import create_param
 from tpu_inference.layers.jax.linear import JaxEinsum
@@ -41,6 +42,9 @@ from tpu_inference.layers.jax.quantization.configs import (QuantizationConfig,
                                                            QuantLinearConfig)
 from tpu_inference.layers.jax.quantization.unquantized import (
     UnquantizedFusedMoEMethod, UnquantizedLinearMethod)
+from tpu_inference.layers.jax.moe.routing_stats import (
+    compute_routing_stats_from_logits,
+)
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils.weight_utils import (
     jax_array_from_reshaped_torch, load_nnx_param_from_reshaped_torch,
@@ -139,7 +143,12 @@ class Fp8TensorwiseLinearMethod(QuantizeMethodBase,
                                           dtype=jnp.float32,
                                           sharding=scale_sharding)
 
-    def apply_jax(self, layer: JaxModule, x: jax.Array) -> jax.Array:
+    def apply_jax(self,
+                  layer: JaxModule,
+                  x: jax.Array,
+                  *,
+                  capture_routing_stats: bool = False,
+                  layer_idx: int | None = None) -> jax.Array:
         bias = layer.bias[...] if layer.bias is not None else None
 
         if self.batch_features:
@@ -592,6 +601,7 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                                        P(*layer.activation_ffw_td)))
 
         router_logits = None
+        routing_stats = None
         # Fused weight backends
         if layer.moe_backend in FP8_QUANT_METHOD_SUPPORTED_MOE_BACKENDS:
             # of shape TE -- we don't return the indices
@@ -623,9 +633,29 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                 f"Unsupported moe backend: {layer.moe_backend}! Currently supported: {FP8_QUANT_METHOD_SUPPORTED_MOE_BACKENDS}"
             )
 
-        return moe_apply(layer, x_TD, router_logits, weights,
-                         layer.moe_backend, layer.mesh,
-                         self.extra_backend_kwargs)
+        if capture_routing_stats:
+            bytes_per_element = x_TD.dtype.itemsize
+            routing_stats = compute_routing_stats_from_logits(
+                router_logits=router_logits,
+                k=layer.top_k,
+                scoring_func=layer.scoring_func,
+                renormalize=layer.renormalize,
+                hidden_size=layer.hidden_size,
+                bytes_per_element=bytes_per_element,
+                layer_idx=layer_idx,
+                include_router_logits=True,
+                include_router_probs=envs.CAPTURE_MOE_ROUTER_PROBS,
+                include_unique_token_counts=True,
+                routing_is_exact=layer.moe_backend
+                in (MoEBackend.GMM_EP, MoEBackend.GMM_TP),
+            )
+
+        output = moe_apply(layer, x_TD, router_logits, weights,
+                           layer.moe_backend, layer.mesh,
+                           self.extra_backend_kwargs)
+        if capture_routing_stats:
+            return output, routing_stats
+        return output
 
 
 class Fp8Config(QuantizationConfig):

@@ -23,6 +23,11 @@ if TYPE_CHECKING:
     USE_MOE_EP_KERNEL: bool = False
     USE_UNFUSED_MEGABLOCKS: bool = False
     USE_DENSE_MOE: bool = False
+    CAPTURE_MOE_ROUTING_STATS: bool = False
+    CAPTURE_MOE_ROUTER_PROBS: bool = False
+    MOE_ROUTING_STATS_DIR: str = ""
+    MOE_ROUTING_STATS_SAVE_RAW: bool = True
+    MOE_ROUTING_STATS_SAVE_SUMMARY: bool = True
     NUM_SLICES: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
@@ -160,6 +165,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NOTE: this is a naive implementation and should not be used in production
     "USE_DENSE_MOE":
     env_bool("USE_DENSE_MOE", default=False),
+    # Capture MoE routing stats during forward pass (debug/tracing only).
+    "CAPTURE_MOE_ROUTING_STATS":
+    env_bool("CAPTURE_MOE_ROUTING_STATS", default=False),
+    # Include full router probabilities in routing stats (large tensors).
+    "CAPTURE_MOE_ROUTER_PROBS":
+    env_bool("CAPTURE_MOE_ROUTER_PROBS", default=False),
+    # Output directory for MoE routing traces (empty disables persistence).
+    "MOE_ROUTING_STATS_DIR":
+    lambda: os.getenv("MOE_ROUTING_STATS_DIR", ""),
+    # Persist raw per-layer arrays in NPZ.
+    "MOE_ROUTING_STATS_SAVE_RAW":
+    env_bool("MOE_ROUTING_STATS_SAVE_RAW", default=True),
+    # Persist compact per-layer/per-expert summaries in JSONL.
+    "MOE_ROUTING_STATS_SAVE_SUMMARY":
+    env_bool("MOE_ROUTING_STATS_SAVE_SUMMARY", default=True),
     # Number of TPU slices for multi-slice mesh
     "NUM_SLICES":
     lambda: int(os.getenv("NUM_SLICES") or "1"),

@@ -21,6 +21,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from tpu_inference.layers.common.moe import MoEBackend, moe_apply
+from tpu_inference import envs
 from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, UnfusedMoEWeights)
 from tpu_inference.layers.common.quantization import unquantized as jax_common
@@ -31,6 +32,10 @@ from tpu_inference.layers.jax.moe.moe import JaxMoE
 from tpu_inference.layers.jax.quantization import QuantizeMethodBase
 from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
 from tpu_inference.models.jax.utils.weight_utils import shard_put
+from tpu_inference.layers.jax.moe.routing_stats import (
+    compute_routing_stats_from_logits,
+    compute_routing_stats_from_topk,
+)
 
 
 class UnquantizedLinearMethod(QuantizeMethodBase,
@@ -128,7 +133,12 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
 
         return True
 
-    def apply_jax(self, layer: JaxModule, x: jax.Array) -> jax.Array:
+    def apply_jax(self,
+                  layer: JaxModule,
+                  x: jax.Array,
+                  *,
+                  capture_routing_stats: bool = False,
+                  layer_idx: int | None = None) -> jax.Array:
         assert isinstance(layer, JaxMoE)
 
         x_TD = jnp.asarray(x, layer.dtype)
@@ -136,6 +146,7 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
             x_TD, NamedSharding(layer.mesh, P(*layer.activation_ffw_td)))
 
         router_logits = None
+        routing_stats = None
         # Fused weight backends
         if layer.moe_backend in MoEBackend.fused_moe_backends():
             # of shape TE, only 1D in this case
@@ -174,9 +185,42 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
 
         else:
             raise ValueError(f"Unsupported moe backend {layer.moe_backend}")
-        return moe_apply(layer, x_TD, router_logits, weights,
-                         layer.moe_backend, layer.mesh,
-                         self.extra_backend_kwargs)
+        if capture_routing_stats:
+            bytes_per_element = x_TD.dtype.itemsize
+            if isinstance(router_logits, tuple):
+                # Router returned (weights, indices) directly.
+                weights_TX, indices_TX = router_logits
+                routing_stats = compute_routing_stats_from_topk(
+                    topk_scores=weights_TX,
+                    topk_experts=indices_TX,
+                    num_experts=layer.num_local_experts,
+                    hidden_size=layer.hidden_size,
+                    bytes_per_element=bytes_per_element,
+                    layer_idx=layer_idx,
+                    routing_is_exact=True,
+                )
+            else:
+                routing_stats = compute_routing_stats_from_logits(
+                    router_logits=router_logits,
+                    k=layer.top_k,
+                    scoring_func=layer.scoring_func,
+                    renormalize=layer.renormalize,
+                    hidden_size=layer.hidden_size,
+                    bytes_per_element=bytes_per_element,
+                    layer_idx=layer_idx,
+                    include_router_logits=True,
+                    include_router_probs=envs.CAPTURE_MOE_ROUTER_PROBS,
+                    include_unique_token_counts=True,
+                    routing_is_exact=layer.moe_backend
+                    in (MoEBackend.GMM_EP, MoEBackend.GMM_TP),
+                )
+
+        output = moe_apply(layer, x_TD, router_logits, weights,
+                           layer.moe_backend, layer.mesh,
+                           self.extra_backend_kwargs)
+        if capture_routing_stats:
+            return output, routing_stats
+        return output
 
 
 class UnquantizedConfig(QuantizationConfig):
