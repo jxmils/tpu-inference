@@ -25,6 +25,8 @@ class VllmModelWrapperContext:
     kv_caches: List[jax.Array]
     mesh: Mesh
     layer_name_to_kvcache_index: Dict[str, int]
+    routing_stats: Optional[List[Optional[dict]]] = None
+    routing_stats_next_index: int = 0
 
 
 _vllm_model_wrapper_context: Optional[VllmModelWrapperContext] = None
@@ -38,12 +40,34 @@ def get_vllm_model_wrapper_context() -> VllmModelWrapperContext:
     return _vllm_model_wrapper_context
 
 
+def record_vllm_routing_stats(layer_idx: Optional[int],
+                              stats: dict) -> None:
+    if _vllm_model_wrapper_context is None:
+        return
+    ctx = _vllm_model_wrapper_context
+    if ctx.routing_stats is None:
+        return
+    if layer_idx is None or layer_idx < 0:
+        idx = ctx.routing_stats_next_index
+        if idx >= len(ctx.routing_stats):
+            ctx.routing_stats.append(stats)
+        else:
+            ctx.routing_stats[idx] = stats
+        ctx.routing_stats_next_index = idx + 1
+        return
+    if layer_idx >= len(ctx.routing_stats):
+        ctx.routing_stats.extend([None] * (layer_idx + 1 - len(ctx.routing_stats)))
+    ctx.routing_stats[layer_idx] = stats
+    ctx.routing_stats_next_index = max(ctx.routing_stats_next_index, layer_idx + 1)
+
+
 @contextmanager
 def set_vllm_model_wrapper_context(
     *,
     kv_caches: List[jax.Array],
     mesh: Mesh,
     layer_name_to_kvcache_index: Dict[str, int] = None,
+    routing_stats: Optional[List[Optional[dict]]] = None,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
@@ -51,6 +75,8 @@ def set_vllm_model_wrapper_context(
         kv_caches=kv_caches,
         mesh=mesh,
         layer_name_to_kvcache_index=layer_name_to_kvcache_index,
+        routing_stats=routing_stats,
+        routing_stats_next_index=0,
     )
 
     try:

@@ -156,8 +156,16 @@ class RoutingTraceWriter:
         for layer_idx, layer_stats in enumerate(per_layer):
             if layer_stats is None:
                 continue
+            layer_key_idx = layer_idx
+            if "layer_idx" in layer_stats:
+                try:
+                    candidate_idx = int(layer_stats["layer_idx"])
+                    if candidate_idx >= 0:
+                        layer_key_idx = candidate_idx
+                except Exception:
+                    pass
             for key, value in layer_stats.items():
-                raw[f"layer_{layer_idx}_{key}"] = value
+                raw[f"layer_{layer_key_idx}_{key}"] = value
 
         np.savez_compressed(raw_path, **raw)
 
@@ -187,6 +195,14 @@ class RoutingTraceWriter:
             for layer_idx, layer_stats in enumerate(per_layer):
                 if layer_stats is None:
                     continue
+                layer_key_idx = layer_idx
+                if "layer_idx" in layer_stats:
+                    try:
+                        candidate_idx = int(layer_stats["layer_idx"])
+                        if candidate_idx >= 0:
+                            layer_key_idx = candidate_idx
+                    except Exception:
+                        pass
 
                 routing_is_exact = int(layer_stats["routing_is_exact"])
                 num_experts = int(layer_stats["num_experts"])
@@ -261,7 +277,7 @@ class RoutingTraceWriter:
                             "batch_index":
                             int(req_idx),
                             "layer_idx":
-                            int(layer_idx),
+                            int(layer_key_idx),
                             "expert_id":
                             int(expert_id),
                             "decode_step":

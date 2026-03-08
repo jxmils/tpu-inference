@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
 import torch
 from torchax.interop import jax_view, torch_view
 from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
@@ -20,9 +21,43 @@ from tpu_inference import envs
 from tpu_inference.layers.common.moe import MoEBackend, moe_apply
 from tpu_inference.layers.common.process_weights.moe_weights import \
     FusedMoEWeights
+from tpu_inference.layers.jax.moe.routing_stats import \
+    compute_routing_stats_from_logits
 from tpu_inference.logger import init_logger
+from tpu_inference.models.vllm.vllm_model_wrapper_context import \
+    record_vllm_routing_stats
 
 logger = init_logger(__name__)
+
+
+def _extract_layer_idx(layer: FusedMoE) -> int | None:
+    for name in ("layer_idx", "layer_id", "layer_number", "layer_index"):
+        value = getattr(layer, name, None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    layer_name = getattr(layer, "layer_name", None) or getattr(layer, "name",
+                                                               None)
+    if isinstance(layer_name, str):
+        match = re.search(r"(?:layers?|blocks?)\\.(\\d+)", layer_name)
+        if match is not None:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _get_layer_attr(layer: FusedMoE,
+                    name: str,
+                    default=None):
+    value = getattr(layer, name, None)
+    if value is not None:
+        return value
+    moe_config = getattr(layer, "moe_config", None)
+    return getattr(moe_config, name, default)
 
 
 def select_moe_backend_from_fused_moe_config(
@@ -76,6 +111,41 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
     assert isinstance(layer, FusedMoE)
     assert isinstance(quant_method_instance, FusedMoEMethodBase)
     assert isinstance(weights, FusedMoEWeights)
+
+    if envs.moe_routing_stats_enabled():
+        try:
+            k = _get_layer_attr(layer, "top_k", None)
+            if k is None:
+                k = _get_layer_attr(layer, "num_experts_per_tok", None)
+            if k is None:
+                logger.warning_once(
+                    "MoE routing stats skipped: missing top_k for layer %s",
+                    type(layer))
+            else:
+                scoring_func = _get_layer_attr(layer, "scoring_func",
+                                               "softmax")
+                renormalize = bool(
+                    _get_layer_attr(layer, "renormalize", False))
+                layer_idx = _extract_layer_idx(layer)
+                hidden_size = int(x.shape[-1])
+                bytes_per_element = int(x.element_size())
+                routing_stats = compute_routing_stats_from_logits(
+                    router_logits=jax_view(router_logits),
+                    k=int(k),
+                    scoring_func=str(scoring_func),
+                    renormalize=renormalize,
+                    hidden_size=hidden_size,
+                    bytes_per_element=bytes_per_element,
+                    layer_idx=layer_idx,
+                    include_router_logits=True,
+                    include_router_probs=envs.moe_router_probs_enabled(),
+                    include_unique_token_counts=True,
+                    routing_is_exact=quant_method_instance.moe_backend
+                    in (MoEBackend.GMM_EP, MoEBackend.GMM_TP),
+                )
+                record_vllm_routing_stats(layer_idx, routing_stats)
+        except Exception as exc:
+            logger.warning_once("MoE routing stats capture failed: %s", exc)
 
     return torch_view(
         moe_apply(

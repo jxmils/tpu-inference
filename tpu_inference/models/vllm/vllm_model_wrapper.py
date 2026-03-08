@@ -20,6 +20,7 @@ from typing import Any, List, Optional, Tuple
 from unittest.mock import patch
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.nn
@@ -60,6 +61,30 @@ from tpu_inference.models.vllm.vllm_model_wrapper_context import (
 from tpu_inference.runner.lora_utils import replace_lora_metadata
 
 logger = init_logger(__name__)
+
+
+def _aggregate_routing_stats(per_layer_stats: List[dict | None]) -> dict:
+    present = [stats for stats in per_layer_stats if stats is not None]
+    if not present:
+        return {}
+    total_expert_counts = sum(stats["expert_counts"] for stats in present)
+    total_unique_token_counts = sum(
+        stats["unique_token_counts"] for stats in present)
+    total_dispatch_bytes = sum(stats["estimated_dispatch_bytes"]
+                               for stats in present)
+    total_return_bytes = sum(stats["estimated_return_bytes"]
+                             for stats in present)
+    return {
+        "num_layers": jnp.asarray(len(present), dtype=jnp.int32),
+        "num_experts": present[0]["num_experts"],
+        "k": present[0]["k"],
+        "expert_counts": total_expert_counts,
+        "unique_token_counts": total_unique_token_counts,
+        "estimated_dispatch_bytes": total_dispatch_bytes,
+        "estimated_return_bytes": total_return_bytes,
+        "estimated_dispatch_bytes_total": jnp.sum(total_dispatch_bytes),
+        "estimated_return_bytes_total": jnp.sum(total_return_bytes),
+    }
 
 
 class _VllmRunner(torch.nn.Module):
@@ -247,13 +272,25 @@ class VllmModelWrapper:
             is_first_rank: bool = True,
             is_last_rank: bool = True,
             *args,
-        ) -> Tuple[List[jax.Array], jax.Array]:
+        ) -> Tuple[List[jax.Array], jax.Array, object]:
             layer_name_to_kvcache_index = dict(layer_name_to_kvcache_index)
             lora_metadata = torch_view(lora_metadata)
+            capture_routing_stats = envs.moe_routing_stats_enabled()
+            num_layers = getattr(
+                getattr(self.vllm_config, "model_config", None), "hf_config",
+                None)
+            num_layers = getattr(num_layers, "num_hidden_layers", None)
+            routing_stats = None
+            if capture_routing_stats:
+                if num_layers is None:
+                    routing_stats = []
+                else:
+                    routing_stats = [None] * int(num_layers)
             with torchax.default_env(), set_vllm_model_wrapper_context(
                     kv_caches=kv_caches,
                     mesh=self.mesh,
-                    layer_name_to_kvcache_index=layer_name_to_kvcache_index
+                    layer_name_to_kvcache_index=layer_name_to_kvcache_index,
+                    routing_stats=routing_stats,
             ), set_forward_context(attn_metadata=attn_metadata,
                                    vllm_config=self.vllm_config):
                 # We need to wrap args from jax land into TorchValue with
@@ -277,12 +314,19 @@ class VllmModelWrapper:
                                       self.vllm_config.lora_config)
                 vllm_model_wrapper_context = get_vllm_model_wrapper_context()
                 new_kv_caches = vllm_model_wrapper_context.kv_caches
+                routing_stats = vllm_model_wrapper_context.routing_stats
             # Wrap the output(hidden states or intermediate tensor)
             # from torch land into a JaxValue for the jax code to consume.
             if not is_last_rank:
                 output = JaxIntermediateTensors.from_torch(output_from_torch)
             else:
                 output = jax_view(output_from_torch)
+            if capture_routing_stats:
+                routing_payload = {
+                    "per_layer": routing_stats or [],
+                    "aggregate": _aggregate_routing_stats(routing_stats or []),
+                }
+                return new_kv_caches, output, ([], routing_payload)
             return new_kv_caches, output, []
 
         return step_fun
