@@ -644,7 +644,7 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                 bytes_per_element=bytes_per_element,
                 layer_idx=layer_idx,
                 include_router_logits=True,
-                include_router_probs=envs.CAPTURE_MOE_ROUTER_PROBS,
+                include_router_probs=envs.moe_router_probs_enabled(),
                 include_unique_token_counts=True,
                 routing_is_exact=layer.moe_backend
                 in (MoEBackend.GMM_EP, MoEBackend.GMM_TP),

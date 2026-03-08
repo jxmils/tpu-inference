@@ -278,7 +278,7 @@ def get_flax_model(
     # https://flax.readthedocs.io/en/latest/guides/performance.html
     graphdef, state = nnx.split(jit_model)
 
-    out_shardings = None if envs.CAPTURE_MOE_ROUTING_STATS else (
+    out_shardings = None if envs.moe_routing_stats_enabled() else (
         kv_cache_sharding,
         hidden_states_sharding,
         hidden_states_sharding,  # aux hidden states

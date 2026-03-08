@@ -23,9 +23,9 @@ if TYPE_CHECKING:
     USE_MOE_EP_KERNEL: bool = False
     USE_UNFUSED_MEGABLOCKS: bool = False
     USE_DENSE_MOE: bool = False
-    CAPTURE_MOE_ROUTING_STATS: bool = False
-    CAPTURE_MOE_ROUTER_PROBS: bool = False
-    MOE_ROUTING_STATS_DIR: str = ""
+    CAPTURE_MOE_ROUTING_STATS: bool
+    CAPTURE_MOE_ROUTER_PROBS: bool
+    MOE_ROUTING_STATS_DIR: str
     MOE_ROUTING_STATS_SAVE_RAW: bool = True
     MOE_ROUTING_STATS_SAVE_SUMMARY: bool = True
     NUM_SLICES: int = 1
@@ -110,6 +110,27 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
     return _get_bool_env
 
 
+DEFAULT_MOE_ROUTING_STATS_DIR = "/home/jasonmiller"
+
+
+def moe_routing_stats_enabled() -> bool:
+    if "CAPTURE_MOE_ROUTING_STATS" not in os.environ:
+        return True
+    return env_bool("CAPTURE_MOE_ROUTING_STATS", default=True)()
+
+
+def moe_router_probs_enabled() -> bool:
+    if "CAPTURE_MOE_ROUTER_PROBS" not in os.environ:
+        return True
+    return env_bool("CAPTURE_MOE_ROUTER_PROBS", default=True)()
+
+
+def moe_routing_stats_dir() -> str:
+    if "MOE_ROUTING_STATS_DIR" in os.environ:
+        return os.getenv("MOE_ROUTING_STATS_DIR") or ""
+    return DEFAULT_MOE_ROUTING_STATS_DIR
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
@@ -167,13 +188,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("USE_DENSE_MOE", default=False),
     # Capture MoE routing stats during forward pass (debug/tracing only).
     "CAPTURE_MOE_ROUTING_STATS":
-    env_bool("CAPTURE_MOE_ROUTING_STATS", default=False),
+    moe_routing_stats_enabled,
     # Include full router probabilities in routing stats (large tensors).
     "CAPTURE_MOE_ROUTER_PROBS":
-    env_bool("CAPTURE_MOE_ROUTER_PROBS", default=False),
+    moe_router_probs_enabled,
     # Output directory for MoE routing traces (empty disables persistence).
     "MOE_ROUTING_STATS_DIR":
-    lambda: os.getenv("MOE_ROUTING_STATS_DIR", ""),
+    moe_routing_stats_dir,
     # Persist raw per-layer arrays in NPZ.
     "MOE_ROUTING_STATS_SAVE_RAW":
     env_bool("MOE_ROUTING_STATS_SAVE_RAW", default=True),

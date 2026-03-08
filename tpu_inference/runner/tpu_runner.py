@@ -291,9 +291,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._routing_trace_writer: RoutingTraceWriter | None = None
         self._routing_trace_batch_meta: RoutingTraceBatchMeta | None = None
         self._routing_trace_step: int = 0
-        if envs.CAPTURE_MOE_ROUTING_STATS and envs.MOE_ROUTING_STATS_DIR:
+        capture_routing_stats = envs.moe_routing_stats_enabled()
+        routing_stats_dir = envs.moe_routing_stats_dir()
+        if capture_routing_stats and routing_stats_dir:
             self._routing_trace_writer = RoutingTraceWriter(
-                envs.MOE_ROUTING_STATS_DIR,
+                routing_stats_dir,
                 save_raw=envs.MOE_ROUTING_STATS_SAVE_RAW,
                 save_summary=envs.MOE_ROUTING_STATS_SAVE_SUMMARY,
             )

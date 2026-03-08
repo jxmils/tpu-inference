@@ -149,7 +149,8 @@ class Qwen3MoeSparseMoeBlock(JaxModule):
                  *,
                  layer_idx: int | None = None) -> jax.Array | tuple[jax.Array,
                                                                    dict]:
-        if envs.CAPTURE_MOE_ROUTING_STATS:
+        capture_routing_stats = envs.moe_routing_stats_enabled()
+        if capture_routing_stats:
             out, routing_stats = self.experts(x,
                                               capture_routing_stats=True,
                                               layer_idx=layer_idx)
@@ -235,13 +236,14 @@ class Qwen3MoeDecoderLayer(JaxModule):
 
         residual = attn_output
         attn_output = self.post_attention_layernorm(attn_output)
-        if envs.CAPTURE_MOE_ROUTING_STATS:
+        capture_routing_stats = envs.moe_routing_stats_enabled()
+        if capture_routing_stats:
             outputs, routing_stats = self.mlp(attn_output,
                                               layer_idx=self.layer_idx)
         else:
             outputs = self.mlp(attn_output)
         outputs = residual + outputs
-        if envs.CAPTURE_MOE_ROUTING_STATS:
+        if capture_routing_stats:
             return kv_cache, outputs, routing_stats
         return kv_cache, outputs
 
@@ -320,7 +322,8 @@ class Qwen3MoeModel(JaxModule):
 
         x = inputs_embeds
         new_kv_caches = []
-        routing_stats = [] if envs.CAPTURE_MOE_ROUTING_STATS else None
+        capture_routing_stats = envs.moe_routing_stats_enabled()
+        routing_stats = [] if capture_routing_stats else None
         for i, layer in enumerate(self.layers):
             if isinstance(layer, PPMissingLayer):
                 new_kv_caches.append(kv_caches[i])
@@ -328,7 +331,7 @@ class Qwen3MoeModel(JaxModule):
                     routing_stats.append(None)
                 continue
             kv_cache = kv_caches[i]
-            if envs.CAPTURE_MOE_ROUTING_STATS:
+            if capture_routing_stats:
                 kv_cache, x, layer_stats = layer(kv_cache, x,
                                                  attention_metadata)
                 routing_stats.append(layer_stats)
@@ -339,7 +342,7 @@ class Qwen3MoeModel(JaxModule):
         if self.is_last_rank:
             x = self.norm(x)
 
-        if envs.CAPTURE_MOE_ROUTING_STATS:
+        if capture_routing_stats:
             return new_kv_caches, x, {
                 "per_layer": routing_stats,
                 "aggregate": _aggregate_routing_stats(routing_stats),
@@ -406,7 +409,8 @@ class Qwen3MoeForCausalLM(JaxModule, LoadableWithIterator):
         if not is_first_rank:
             assert intermediate_tensors is not None
             inputs_embeds = intermediate_tensors["hidden_states"]
-        if envs.CAPTURE_MOE_ROUTING_STATS:
+        capture_routing_stats = envs.moe_routing_stats_enabled()
+        if capture_routing_stats:
             kv_caches, x, routing_stats = self.model(
                 kv_caches,
                 input_ids,
@@ -422,7 +426,7 @@ class Qwen3MoeForCausalLM(JaxModule, LoadableWithIterator):
             )
         if not is_last_rank:
             x = JaxIntermediateTensors(tensors={"hidden_states": x}, )
-        if envs.CAPTURE_MOE_ROUTING_STATS:
+        if capture_routing_stats:
             return kv_caches, x, ([], routing_stats)
         return kv_caches, x, []
 
