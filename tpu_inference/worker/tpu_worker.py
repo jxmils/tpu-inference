@@ -297,6 +297,15 @@ class TPUWorker(WorkerBase):
                     f"self.devices={self.devices} | "
                     f"total devices={jax.devices()} | "
                     f"local_devices={jax.local_devices()}")
+        self.model_runner.capture_hbm_snapshot(
+            "worker_initialized",
+            extra={
+                "is_driver_worker": bool(self.is_driver_worker),
+                "is_first_rank": bool(is_first_rank),
+                "is_last_rank": bool(is_last_rank),
+                "topology_order_id": int(self.topology_order_id),
+            },
+        )
         vllm_utils.report_usage_stats(self.vllm_config)
 
     def initialize_pp_transfer_connect(self):
@@ -334,6 +343,16 @@ class TPUWorker(WorkerBase):
                     f"{total_hbm_limit_cap_gb=}GiB | "
                     f"{total_hbm_used_gb=}GiB | "
                     f"{total_hbm_avail_gb=}GiB")
+        self.model_runner.capture_hbm_snapshot(
+            "available_memory_determined",
+            extra={
+                "gpu_memory_utilization": float(gpu_memory_utilization),
+                "total_hbm_limit_bytes": int(total_hbm_limit),
+                "total_hbm_limit_cap_bytes": int(total_hbm_limit_cap),
+                "total_hbm_used_bytes": int(total_hbm_used),
+                "total_hbm_avail_bytes": int(total_hbm_avail),
+            },
+        )
 
         if total_hbm_avail <= 0:
             raise ValueError(f"{total_hbm_used_gb=}GiB exceeds "

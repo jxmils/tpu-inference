@@ -48,6 +48,10 @@ def _assemble_stats(
     hidden_size: int,
     bytes_per_element: int,
     layer_idx: Optional[int],
+    data_axis_name: Optional[str] = None,
+    num_expert_parallelism: int = 1,
+    num_local_experts: Optional[int] = None,
+    capture_a2a: bool = False,
     router_logits: Optional[jax.Array] = None,
     router_probs: Optional[jax.Array] = None,
     include_router_logits: bool = True,
@@ -92,6 +96,18 @@ def _assemble_stats(
         "routing_is_exact": _as_i32(1 if routing_is_exact else 0),
     }
 
+    if capture_a2a and num_expert_parallelism > 0 and data_axis_name is not None:
+        local_experts = num_local_experts or num_experts
+        local_expert_size = local_experts // num_expert_parallelism
+        expert_shards = jnp.floor_divide(topk_experts, local_expert_size)
+        expert_shards_flat = expert_shards.reshape(-1)
+        local_counts = jnp.bincount(expert_shards_flat,
+                                    length=num_expert_parallelism)
+        a2a_counts = jax.lax.all_gather(local_counts, axis_name=data_axis_name)
+        stats["a2a_counts"] = a2a_counts
+        stats["a2a_bytes"] = a2a_counts.astype(jnp.int64) * bytes_per_token
+        stats["a2a_num_expert_shards"] = _as_i32(num_expert_parallelism)
+
     if include_router_logits and router_logits is not None:
         stats["router_logits"] = router_logits
     if include_router_probs and router_probs is not None:
@@ -109,6 +125,10 @@ def compute_routing_stats_from_logits(
     hidden_size: int,
     bytes_per_element: int,
     layer_idx: Optional[int] = None,
+    data_axis_name: Optional[str] = None,
+    num_expert_parallelism: int = 1,
+    num_local_experts: Optional[int] = None,
+    capture_a2a: bool = False,
     include_router_logits: bool = True,
     include_router_probs: bool = False,
     include_unique_token_counts: bool = True,
@@ -127,6 +147,10 @@ def compute_routing_stats_from_logits(
         hidden_size=hidden_size,
         bytes_per_element=bytes_per_element,
         layer_idx=layer_idx,
+        data_axis_name=data_axis_name,
+        num_expert_parallelism=num_expert_parallelism,
+        num_local_experts=num_local_experts,
+        capture_a2a=capture_a2a,
         router_logits=router_logits,
         router_probs=router_probs,
         include_router_logits=include_router_logits,
@@ -144,6 +168,10 @@ def compute_routing_stats_from_topk(
     hidden_size: int,
     bytes_per_element: int,
     layer_idx: Optional[int] = None,
+    data_axis_name: Optional[str] = None,
+    num_expert_parallelism: int = 1,
+    num_local_experts: Optional[int] = None,
+    capture_a2a: bool = False,
     include_unique_token_counts: bool = True,
     routing_is_exact: bool = True,
 ) -> Dict[str, jax.Array]:
@@ -154,6 +182,10 @@ def compute_routing_stats_from_topk(
         hidden_size=hidden_size,
         bytes_per_element=bytes_per_element,
         layer_idx=layer_idx,
+        data_axis_name=data_axis_name,
+        num_expert_parallelism=num_expert_parallelism,
+        num_local_experts=num_local_experts,
+        capture_a2a=capture_a2a,
         router_logits=None,
         router_probs=None,
         include_router_logits=False,

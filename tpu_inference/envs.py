@@ -25,7 +25,10 @@ if TYPE_CHECKING:
     USE_DENSE_MOE: bool = False
     CAPTURE_MOE_ROUTING_STATS: bool
     CAPTURE_MOE_ROUTER_PROBS: bool
+    CAPTURE_MOE_ROUTING_A2A: bool
+    CAPTURE_HBM_STATS: bool
     MOE_ROUTING_STATS_DIR: str
+    HBM_STATS_DIR: str
     MOE_ROUTING_STATS_SAVE_RAW: bool = True
     MOE_ROUTING_STATS_SAVE_SUMMARY: bool = True
     NUM_SLICES: int = 1
@@ -125,10 +128,28 @@ def moe_router_probs_enabled() -> bool:
     return env_bool("CAPTURE_MOE_ROUTER_PROBS", default=True)()
 
 
+def moe_routing_a2a_enabled() -> bool:
+    if "CAPTURE_MOE_ROUTING_A2A" not in os.environ:
+        return True
+    return env_bool("CAPTURE_MOE_ROUTING_A2A", default=True)()
+
+
 def moe_routing_stats_dir() -> str:
     if "MOE_ROUTING_STATS_DIR" in os.environ:
         return os.getenv("MOE_ROUTING_STATS_DIR") or ""
     return DEFAULT_MOE_ROUTING_STATS_DIR
+
+
+def hbm_stats_enabled() -> bool:
+    if "CAPTURE_HBM_STATS" not in os.environ:
+        return True
+    return env_bool("CAPTURE_HBM_STATS", default=True)()
+
+
+def hbm_stats_dir() -> str:
+    if "HBM_STATS_DIR" in os.environ:
+        return os.getenv("HBM_STATS_DIR") or ""
+    return moe_routing_stats_dir()
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -192,9 +213,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Include full router probabilities in routing stats (large tensors).
     "CAPTURE_MOE_ROUTER_PROBS":
     moe_router_probs_enabled,
+    # Capture device-level A2A routing matrix (data shard -> expert shard).
+    "CAPTURE_MOE_ROUTING_A2A":
+    moe_routing_a2a_enabled,
     # Output directory for MoE routing traces (empty disables persistence).
     "MOE_ROUTING_STATS_DIR":
     moe_routing_stats_dir,
+    # Capture HBM memory snapshots during model execution.
+    "CAPTURE_HBM_STATS":
+    hbm_stats_enabled,
+    # Output directory for HBM traces (empty disables persistence).
+    "HBM_STATS_DIR":
+    hbm_stats_dir,
     # Persist raw per-layer arrays in NPZ.
     "MOE_ROUTING_STATS_SAVE_RAW":
     env_bool("MOE_ROUTING_STATS_SAVE_RAW", default=True),

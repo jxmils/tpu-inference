@@ -72,6 +72,7 @@ from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 from tpu_inference.runner.lora_utils import LoraUtils
 from tpu_inference.runner.multimodal_manager import MultiModalManager
+from tpu_inference.runner.hbm_trace import HBMTraceWriter
 from tpu_inference.runner.moe_routing_trace import (RoutingTraceBatchMeta,
                                                     RoutingTraceWriter)
 from tpu_inference.runner.persistent_batch_manager import \
@@ -258,6 +259,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._init_inputs()
         self._init_speculative_decoding()
         self._init_routing_trace()
+        self._init_hbm_trace()
 
         # Delegate functions to specific manager classes.
         self.compilation_manager = CompilationManager(self)
@@ -286,6 +288,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.is_pooling_model: bool = self.model_config.runner_type == "pooling"
         """Generative model or pooling model select different computations."""
+        self._persist_hbm_snapshot("runner_initialized")
 
     def _init_routing_trace(self) -> None:
         self._routing_trace_writer: RoutingTraceWriter | None = None
@@ -300,12 +303,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 save_summary=envs.MOE_ROUTING_STATS_SAVE_SUMMARY,
             )
 
-    def _persist_routing_stats(self, routing_stats: object,
-                               scheduler_output: "VllmSchedulerOutput") -> None:
-        if self._routing_trace_writer is None:
-            return
-        if routing_stats is None or self._routing_trace_batch_meta is None:
-            return
+    def _init_hbm_trace(self) -> None:
+        self._hbm_trace_writer: HBMTraceWriter | None = None
+        hbm_stats_dir = envs.HBM_STATS_DIR
+        if envs.CAPTURE_HBM_STATS and hbm_stats_dir:
+            self._hbm_trace_writer = HBMTraceWriter(hbm_stats_dir,
+                                                   rank=self.rank)
+
+    def _needs_trace_batch_meta(self) -> bool:
+        return (self._routing_trace_writer is not None
+                or self._hbm_trace_writer is not None)
+
+    def _build_request_seq_ids(self) -> Dict[str, Any]:
         request_seq_ids: Dict[str, Any] = {}
         for req_id in self.input_batch.req_ids[:self.input_batch.num_reqs]:
             if req_id is None:
@@ -317,6 +326,69 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 if seq_id is None:
                     seq_id = getattr(req_state, "request_id", None)
             request_seq_ids[req_id] = seq_id if seq_id is not None else req_id
+        return request_seq_ids
+
+    def _block_until_ready_for_hbm(self, value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, JaxIntermediateTensors):
+            value.block_until_ready()
+            return
+        if isinstance(value, jax.Array):
+            value.block_until_ready()
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                self._block_until_ready_for_hbm(item)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                self._block_until_ready_for_hbm(item)
+            return
+        block_until_ready = getattr(value, "block_until_ready", None)
+        if callable(block_until_ready):
+            block_until_ready()
+
+    def _persist_hbm_snapshot(self,
+                              event: str,
+                              *,
+                              sync_obj: Any = None,
+                              extra: Optional[Dict[str, Any]] = None) -> None:
+        if self._hbm_trace_writer is None:
+            return
+        if sync_obj is not None:
+            self._block_until_ready_for_hbm(sync_obj)
+        hbm_usage = common_utils.hbm_usage_bytes(self.devices)
+        if not hbm_usage:
+            return
+        self._hbm_trace_writer.write(
+            event=event,
+            hbm_usage=hbm_usage,
+            trace_step=self._routing_trace_step,
+            batch_meta=self._routing_trace_batch_meta,
+            request_seq_ids=self._build_request_seq_ids(),
+            extra=extra,
+        )
+
+    def capture_hbm_snapshot(self,
+                             event: str,
+                             *,
+                             sync_obj: Any = None,
+                             extra: Optional[Dict[str, Any]] = None) -> None:
+        self._persist_hbm_snapshot(event, sync_obj=sync_obj, extra=extra)
+
+    def _advance_trace_step(self) -> None:
+        if (self._routing_trace_writer is None
+                and self._hbm_trace_writer is None):
+            return
+        self._routing_trace_step += 1
+
+    def _persist_routing_stats(self, routing_stats: object,
+                               scheduler_output: "VllmSchedulerOutput") -> None:
+        if self._routing_trace_writer is None:
+            return
+        if routing_stats is None or self._routing_trace_batch_meta is None:
+            return
 
         self._routing_trace_writer.write(
             routing_stats,
@@ -324,10 +396,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             trace_step=self._routing_trace_step,
             batch_id=self._routing_trace_step,
             rank=self.rank,
-            request_seq_ids=request_seq_ids,
+            request_seq_ids=self._build_request_seq_ids(),
             phase_override=None,
         )
-        self._routing_trace_step += 1
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -608,6 +679,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         logger.info(f"Init model | "
                     f"hbm={common_utils.hbm_usage_gb(self.devices)}GiB")
+        self._persist_hbm_snapshot("model_loaded")
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         runner_type = self.model_config.runner_type
@@ -627,6 +699,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.kv_cache_config = kv_cache_config
         self.use_hybrid_kvcache = len(kv_cache_config.kv_cache_groups) > 1
         self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+        self._persist_hbm_snapshot("kv_cache_initialized")
         if has_kv_transfer_group():
             get_kv_transfer_group().register_runner(self)
 
@@ -637,7 +710,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.kv_cache_manager.reinitialize_kv_cache()
 
     def capture_model(self) -> None:
+        self._persist_hbm_snapshot("before_capture_model")
         self.compilation_manager.capture_model()
+        self._persist_hbm_snapshot("after_capture_model")
 
     @time_function
     def execute_model(
@@ -811,6 +886,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices_selector,
             padded_num_reqs,
         ) = self._prepare_inputs(scheduler_output)
+        step_trace_extra = {
+            "num_active_reqs": int(self.input_batch.num_reqs),
+            "num_finished_reqs": int(len(scheduler_output.finished_req_ids)),
+            "total_num_scheduled_tokens":
+            int(scheduler_output.total_num_scheduled_tokens),
+        }
+        self._persist_hbm_snapshot("before_execute_model",
+                                   extra=step_trace_extra)
 
         # multi-modal support
         if self.is_multimodal_model:
@@ -866,6 +949,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
+                self._persist_hbm_snapshot("after_execute_model",
+                                           sync_obj=hidden_states,
+                                           extra=step_trace_extra)
+                self._advance_trace_step()
                 return hidden_states
 
             if self.is_pooling_model:
@@ -878,6 +965,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     pooling_metadata,
                     seq_lens,
                 )
+                self._persist_hbm_snapshot("after_execute_model",
+                                           sync_obj=pooler_output,
+                                           extra=step_trace_extra)
+                self._advance_trace_step()
 
                 return ModelRunnerOutput(
                     req_ids=self.input_batch.req_ids,
@@ -895,6 +986,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 hidden_states,
                 lora_metadata,
             )
+        self._persist_hbm_snapshot("after_execute_model",
+                                   sync_obj=logits,
+                                   extra=step_trace_extra)
+        self._advance_trace_step()
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -1344,7 +1439,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         token_req_indices_full = None
         token_positions_full = None
         token_mask_full = None
-        if self._routing_trace_writer is not None:
+        if self._needs_trace_batch_meta():
             token_req_indices_full = np.full(
                 (padded_total_num_scheduled_tokens, ),
                 -1,
@@ -1458,7 +1553,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         logits_indices = self.logits_indices_cpu[:padded_num_reqs]
 
-        if self._routing_trace_writer is not None:
+        if self._needs_trace_batch_meta():
             num_scheduled_tokens_per_req = []
             for req_id in self.input_batch.req_ids[:num_reqs]:
                 assert req_id is not None
@@ -1687,7 +1782,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                arange,
                out=positions_np)
 
-        if self._routing_trace_writer is not None:
+        if self._needs_trace_batch_meta():
             padded_total = runner_utils.get_padded_token_len(
                 self.num_tokens_paddings, total_num_scheduled_tokens)
             token_req_indices = np.full((padded_total, ),

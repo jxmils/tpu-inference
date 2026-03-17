@@ -197,6 +197,10 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                     hidden_size=layer.hidden_size,
                     bytes_per_element=bytes_per_element,
                     layer_idx=layer_idx,
+                    data_axis_name=layer.data_axis_name,
+                    num_expert_parallelism=layer.num_expert_parallelism,
+                    num_local_experts=layer.num_local_experts,
+                    capture_a2a=envs.moe_routing_a2a_enabled(),
                     routing_is_exact=True,
                 )
             else:
@@ -208,6 +212,10 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                     hidden_size=layer.hidden_size,
                     bytes_per_element=bytes_per_element,
                     layer_idx=layer_idx,
+                    data_axis_name=layer.data_axis_name,
+                    num_expert_parallelism=layer.num_expert_parallelism,
+                    num_local_experts=layer.num_local_experts,
+                    capture_a2a=envs.moe_routing_a2a_enabled(),
                     include_router_logits=True,
                     include_router_probs=envs.moe_router_probs_enabled(),
                     include_unique_token_counts=True,
