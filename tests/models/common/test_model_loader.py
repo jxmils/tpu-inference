@@ -34,6 +34,7 @@ from tpu_inference.distributed.jax_parallel_state import \
     init_pp_distributed_environment
 from tpu_inference.models.common import model_loader
 from tpu_inference.models.jax.qwen3 import Qwen3ForCausalLM
+from tpu_inference.models.vllm.vllm_model_wrapper import VllmModelWrapper
 
 
 class MockModelA:
@@ -344,6 +345,61 @@ def test_get_vllm_model_random_weights(mock_get_pp_group, mesh):
     assert callable(model_fn)
     assert callable(compute_logits_fn)
     mock_load.assert_called()
+
+
+def test_vllm_model_wrapper_sets_current_config_during_model_load(mesh):
+    rng = jax.random.PRNGKey(42)
+
+    engine_args = EngineArgs(model="Qwen/Qwen3-0.6B")
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.model_config.dtype = torch.bfloat16
+
+    class FakeContext:
+
+        def __init__(self):
+            self.entered = False
+
+        def __enter__(self):
+            self.entered = True
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.entered = False
+
+    class FakeModel(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+
+        def compute_logits(self, hidden_state):
+            return hidden_state
+
+    fake_context = FakeContext()
+
+    def fake_get_model(*, vllm_config):
+        assert fake_context.entered
+        return FakeModel()
+
+    with patch(
+            "tpu_inference.models.vllm.vllm_model_wrapper.get_tpu_quantization_config",
+            return_value=None), patch(
+                "tpu_inference.models.vllm.vllm_model_wrapper.VllmModelWrapper._apply_pp_patch"
+            ), patch(
+                "tpu_inference.models.vllm.vllm_model_wrapper.set_current_vllm_config",
+                return_value=fake_context) as mock_set_current_config, patch(
+                    "tpu_inference.models.vllm.vllm_model_wrapper.vllm_get_model",
+                    side_effect=fake_get_model), patch(
+                        "tpu_inference.models.vllm.vllm_model_wrapper.is_pooling_model",
+                        return_value=False), patch(
+                            "tpu_inference.models.vllm.vllm_model_wrapper.shard_model_to_tpu",
+                            return_value={}), patch(
+                                "tpu_inference.models.vllm.vllm_model_wrapper.jax_view",
+                                side_effect=lambda value: value):
+        wrapper = VllmModelWrapper(vllm_config=vllm_config, rng=rng, mesh=mesh)
+        params, lora_manager = wrapper.load_weights()
+
+    assert params == {}
+    assert lora_manager is None
+    mock_set_current_config.assert_called_once()
 
 
 # ==============================================================================
