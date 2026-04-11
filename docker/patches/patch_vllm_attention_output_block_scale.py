@@ -9,11 +9,33 @@ from pathlib import Path
 def _ensure_import_inspect(text: str) -> str:
     if "\nimport inspect\n" in text or "\nfrom inspect " in text:
         return text
+
+    # Prefer inserting right before TYPE_CHECKING to avoid splitting
+    # parenthesized multiline imports.
+    marker = "\nif TYPE_CHECKING:\n"
+    if marker in text:
+        return text.replace(marker, "\nimport inspect" + marker, 1)
+
     lines = text.splitlines()
     insert_at = 0
+    in_imports = False
+    paren_balance = 0
     for idx, line in enumerate(lines):
-        if line.startswith("import ") or line.startswith("from "):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not in_imports and (line.startswith("import ") or line.startswith("from ")):
+            in_imports = True
+        if in_imports:
+            paren_balance += line.count("(") - line.count(")")
             insert_at = idx + 1
+            if paren_balance == 0 and not (line.startswith("import ") or line.startswith("from ")):
+                break
+
+    # Keep a visual separation from subsequent code.
+    if insert_at < len(lines) and lines[insert_at].strip():
+        lines.insert(insert_at, "")
+        insert_at += 1
     lines.insert(insert_at, "import inspect")
     return "\n".join(lines) + "\n"
 

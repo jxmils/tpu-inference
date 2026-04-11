@@ -50,6 +50,7 @@ RUN git clone $VLLM_REPO . && \
         git checkout $VLLM_COMMIT_HASH; \
     fi
 RUN python /tmp/patch_vllm_attention_output_block_scale.py
+RUN python -m py_compile /workspace/vllm/vllm/model_executor/layers/attention/attention.py
 
 RUN --mount=type=cache,target=/root/.cache/pip pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements/tpu.txt --retries 3
 RUN --mount=type=cache,target=/root/.cache/pip VLLM_TARGET_DEVICE="tpu" pip install -e .
