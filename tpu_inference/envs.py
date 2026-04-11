@@ -27,8 +27,10 @@ if TYPE_CHECKING:
     CAPTURE_MOE_ROUTER_PROBS: bool
     CAPTURE_MOE_ROUTING_A2A: bool
     CAPTURE_HBM_STATS: bool
+    CAPTURE_REQUEST_STATS: bool
     MOE_ROUTING_STATS_DIR: str
     HBM_STATS_DIR: str
+    REQUEST_STATS_DIR: str
     MOE_ROUTING_STATS_SAVE_RAW: bool = True
     MOE_ROUTING_STATS_SAVE_SUMMARY: bool = True
     NUM_SLICES: int = 1
@@ -152,6 +154,18 @@ def hbm_stats_dir() -> str:
     return moe_routing_stats_dir()
 
 
+def request_stats_enabled() -> bool:
+    if "CAPTURE_REQUEST_STATS" not in os.environ:
+        return True
+    return env_bool("CAPTURE_REQUEST_STATS", default=True)()
+
+
+def request_stats_dir() -> str:
+    if "REQUEST_STATS_DIR" in os.environ:
+        return os.getenv("REQUEST_STATS_DIR") or ""
+    return moe_routing_stats_dir()
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
@@ -225,6 +239,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Output directory for HBM traces (empty disables persistence).
     "HBM_STATS_DIR":
     hbm_stats_dir,
+    # Capture per-request timing and size traces.
+    "CAPTURE_REQUEST_STATS":
+    request_stats_enabled,
+    # Output directory for request traces (empty disables persistence).
+    "REQUEST_STATS_DIR":
+    request_stats_dir,
     # Persist raw per-layer arrays in NPZ.
     "MOE_ROUTING_STATS_SAVE_RAW":
     env_bool("MOE_ROUTING_STATS_SAVE_RAW", default=True),

@@ -75,6 +75,13 @@ def _aggregate_routing_stats(per_layer_stats: List[dict | None]) -> dict:
                                for stats in present)
     total_return_bytes = sum(stats["estimated_return_bytes"]
                              for stats in present)
+    total_a2a_bytes = None
+    total_a2a_counts = None
+    if any("a2a_bytes" in stats for stats in present):
+        total_a2a_bytes = sum(
+            stats.get("a2a_bytes", 0) for stats in present)
+        total_a2a_counts = sum(
+            stats.get("a2a_counts", 0) for stats in present)
     return {
         "num_layers": jnp.asarray(len(present), dtype=jnp.int32),
         "num_experts": present[0]["num_experts"],
@@ -85,6 +92,10 @@ def _aggregate_routing_stats(per_layer_stats: List[dict | None]) -> dict:
         "estimated_return_bytes": total_return_bytes,
         "estimated_dispatch_bytes_total": jnp.sum(total_dispatch_bytes),
         "estimated_return_bytes_total": jnp.sum(total_return_bytes),
+        "a2a_bytes_total": total_a2a_bytes,
+        "a2a_counts_total": total_a2a_counts,
+        "a2a_bytes_total_sum": (jnp.sum(total_a2a_bytes)
+                                if total_a2a_bytes is not None else None),
     }
 
 

@@ -11,6 +11,7 @@ import traceback
 from typing import Any, Callable, Optional, Tuple, TypeVar, Union
 
 import jax
+import torch
 # ======================================================================================
 # Imports for DisaggEngineCoreProc (the vLLM adapter)
 # ======================================================================================
@@ -28,12 +29,14 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.request import Request, RequestStatus
 
 from tpu_inference import utils as common_utils
+from tpu_inference import envs
 from tpu_inference.core import disagg_executor, disagg_utils
 from tpu_inference.runner.tpu_runner import AsyncTPUModelRunnerOutput
 # ======================================================================================
 # Imports for _DisaggOrchestrator (decoupled from vLLM)
 # ======================================================================================
 from tpu_inference.runner.utils import LatencyTracker
+from tpu_inference.runner.request_trace import RequestTraceWriter, bucket_length
 
 # This file contains two classes:
 # 1. _DisaggOrchestrator: The clean, decoupled core orchestration logic.
@@ -148,9 +151,82 @@ class _DisaggOrchestrator:
                 self._decode_threads,
             ))
         self.live = True
+        self._request_trace_writer: RequestTraceWriter | None = None
+        self._request_start_time: dict[str, float] = {}
+        self._last_decode_token_time: dict[str, float] = {}
+        self._ttft_ms: dict[str, float] = {}
+        self._kv_bytes_cache: dict[int, int] = {}
+        self._model_name, self._model_variant, self._model_family = (
+            self._infer_model_info())
+        if envs.CAPTURE_REQUEST_STATS and envs.REQUEST_STATS_DIR:
+            self._request_trace_writer = RequestTraceWriter(
+                envs.REQUEST_STATS_DIR,
+                subdir="request",
+                filename_prefix="request_trace",
+            )
         # Start all threads
         for t in self._all_threads:
             t.start()
+
+    def _infer_model_info(self) -> tuple[str, str, str]:
+        model_config = getattr(self._config, "model_config", None)
+        if model_config is None:
+            return ("unknown", "unknown", "unknown")
+        model_name = (
+            getattr(model_config, "model", None)
+            or getattr(model_config, "model_name", None)
+            or getattr(model_config, "model_tag", None)
+            or "unknown")
+        hf_config = getattr(model_config, "hf_config", None)
+        model_variant = "unknown"
+        if hf_config is not None:
+            model_variant = (
+                getattr(hf_config, "model_type", None)
+                or ",".join(getattr(hf_config, "architectures", []) or [])
+                or "unknown")
+        is_moe = False
+        if hf_config is not None:
+            num_experts = getattr(hf_config, "num_experts", 0)
+            is_moe = bool(num_experts)
+        model_family = "moe" if is_moe else "dense"
+        return (str(model_name), str(model_variant), model_family)
+
+    def _get_kv_bytes_per_token(self, runner) -> int:
+        cache_key = id(runner)
+        cached = self._kv_bytes_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        model_config = runner.model_config
+        parallel_config = runner.parallel_config
+        hf_config = getattr(model_config, "hf_config", None)
+        num_layers = model_config.get_num_layers(parallel_config)
+        try:
+            num_kv_heads = model_config.get_total_num_kv_heads()
+        except Exception:
+            num_kv_heads = getattr(hf_config, "num_key_value_heads",
+                                   model_config.get_num_attention_heads())
+        try:
+            head_size = model_config.get_head_size()
+        except Exception:
+            head_size = model_config.hidden_size // model_config.get_num_attention_heads(
+            )
+        dtype_bytes = 2
+        try:
+            dtype_bytes = torch.tensor([], dtype=runner.kv_cache_dtype).element_size()
+        except Exception:
+            pass
+        bytes_per_token = int(num_kv_heads * head_size * dtype_bytes * 2)
+        total = int(bytes_per_token * num_layers)
+        self._kv_bytes_cache[cache_key] = total
+        return total
+
+    def _record_request_trace(self, record: dict[str, Any]) -> None:
+        if self._request_trace_writer is None:
+            return
+        record.setdefault("model_name", self._model_name)
+        record.setdefault("model_variant", self._model_variant)
+        record.setdefault("model_family", self._model_family)
+        self._request_trace_writer.write(record)
 
     def add_request(self, request: Request):
         """
@@ -166,6 +242,7 @@ class _DisaggOrchestrator:
         # Add to internal state for tracking by other threads.
         # The key is the request_id, the value is the request object.
         self._requests[request.request_id] = request
+        self._request_start_time[request.request_id] = time.perf_counter()
 
     def _prefill(self, idx: int):
         prefill_engine = self._prefill_engines[idx]
@@ -177,6 +254,7 @@ class _DisaggOrchestrator:
                 continue
 
             scheduler_output = prefill_engine.scheduler.schedule()
+            step_start = time.perf_counter()
             with LatencyTracker(f"prefill-{idx}"):
                 future = prefill_engine.model_executor.execute_model(
                     scheduler_output, non_block=True)
@@ -189,6 +267,8 @@ class _DisaggOrchestrator:
                             grammar_output)
                     if isinstance(model_output, AsyncTPUModelRunnerOutput):
                         model_output = model_output.get_output()
+            step_end = time.perf_counter()
+            step_latency_ms = (step_end - step_start) * 1000.0
 
             if scheduler_output.total_num_scheduled_tokens > 0:
                 logger.debug(f"Prefill result: {model_output}")
@@ -210,6 +290,86 @@ class _DisaggOrchestrator:
                 # tweak model_output to let the scheduler know kv_transfer is done for requests, so they can be freed.
                 engine_core_outputs = prefill_engine.scheduler.update_from_output(
                     scheduler_output, model_output)  # type: ignore
+
+                if self._request_trace_writer is not None:
+                    batch_size = len(model_output.req_id_to_index)
+                    active_seq_count = None
+                    try:
+                        active_seq_count = sum(
+                            prefill_engine.scheduler.get_request_counts())
+                    except Exception:
+                        try:
+                            active_seq_count = prefill_engine.model_executor.driver_worker.model_runner.input_batch.num_reqs
+                        except Exception:
+                            active_seq_count = batch_size
+                    runner = prefill_engine.model_executor.driver_worker.model_runner
+                    kv_bytes_per_token = self._get_kv_bytes_per_token(runner)
+                    block_size = self._config.cache_config.block_size
+
+                    for req_id, out_idx in model_output.req_id_to_index.items(
+                    ):
+                        sampled_ids = model_output.sampled_token_ids[out_idx]
+                        if not sampled_ids:
+                            continue
+                        req = self._requests.get(req_id)
+                        if req is None:
+                            continue
+                        prompt_len = len(req.prompt_token_ids)
+                        decode_len = len(req.output_token_ids)
+                        prefill_scheduled = scheduler_output.num_scheduled_tokens.get(
+                            req_id, 0)
+                        num_blocks = max(
+                            1, math.ceil(prompt_len / block_size))
+                        kv_cache_bytes_est = int(num_blocks * block_size *
+                                                 kv_bytes_per_token)
+                        kv_read_bytes_est = int(prompt_len *
+                                                kv_bytes_per_token)
+                        kv_write_bytes_est = int(prefill_scheduled *
+                                                 kv_bytes_per_token)
+
+                        ttft_ms = None
+                        if req_id not in self._ttft_ms:
+                            start_time = self._request_start_time.get(
+                                req_id, step_start)
+                            ttft_ms = (step_end - start_time) * 1000.0
+                            self._ttft_ms[req_id] = ttft_ms
+                        per_token_latency_ms = ttft_ms
+
+                        self._record_request_trace({
+                            "record_type":
+                            "request_step",
+                            "phase":
+                            "prefill",
+                            "request_id":
+                            req_id,
+                            "prefill_token_count":
+                            int(prompt_len),
+                            "decode_token_count":
+                            int(decode_len),
+                            "prefill_scheduled_tokens":
+                            int(prefill_scheduled),
+                            "batch_size":
+                            int(batch_size),
+                            "num_concurrent_sequences":
+                            int(active_seq_count),
+                            "step_latency_ms":
+                            float(step_latency_ms),
+                            "per_token_latency_ms":
+                            float(per_token_latency_ms)
+                            if per_token_latency_ms is not None else None,
+                            "ttft_ms":
+                            float(ttft_ms) if ttft_ms is not None else None,
+                            "kv_cache_bytes_est":
+                            kv_cache_bytes_est,
+                            "kv_read_bytes_est":
+                            kv_read_bytes_est,
+                            "kv_write_bytes_est":
+                            kv_write_bytes_est,
+                            "prompt_length_bucket":
+                            bucket_length(prompt_len),
+                            "output_length_bucket":
+                            bucket_length(decode_len),
+                        })
 
                 for req_id, idx in model_output.req_id_to_index.items():
                     if len(model_output.sampled_token_ids[idx]) > 0:
@@ -362,6 +522,7 @@ class _DisaggOrchestrator:
                 new block ids - {scheduler_output.scheduled_cached_reqs.new_block_ids}'''
                          )
 
+            step_start = time.perf_counter()
             with LatencyTracker(f"decode-{idx}"):
                 future = decode_engine.model_executor.execute_model(
                     scheduler_output, non_block=True)
@@ -374,12 +535,110 @@ class _DisaggOrchestrator:
                             grammar_output)
                     if isinstance(model_output, AsyncTPUModelRunnerOutput):
                         model_output = model_output.get_output()
+            step_end = time.perf_counter()
+            step_latency_ms = (step_end - step_start) * 1000.0
 
             if scheduler_output.total_num_scheduled_tokens > 0:
                 logger.debug(f"Decode result: {model_output}")
 
                 engine_core_outputs = decode_engine.scheduler.update_from_output(
                     scheduler_output, model_output)  # type: ignore
+                if self._request_trace_writer is not None:
+                    batch_size = len(model_output.req_id_to_index)
+                    active_seq_count = None
+                    try:
+                        active_seq_count = sum(
+                            decode_engine.scheduler.get_request_counts())
+                    except Exception:
+                        try:
+                            active_seq_count = decode_engine.model_executor.driver_worker.model_runner.input_batch.num_reqs
+                        except Exception:
+                            active_seq_count = batch_size
+                    runner = decode_engine.model_executor.driver_worker.model_runner
+                    kv_bytes_per_token = self._get_kv_bytes_per_token(runner)
+                    block_size = self._config.cache_config.block_size
+                    routing_trace_step = getattr(runner, "_routing_trace_step",
+                                                 None)
+
+                    for req_id, out_idx in model_output.req_id_to_index.items(
+                    ):
+                        sampled_ids = model_output.sampled_token_ids[out_idx]
+                        if not sampled_ids:
+                            continue
+                        req = decode_engine.scheduler.requests.get(req_id)
+                        if req is None:
+                            continue
+                        prompt_len = len(req.prompt_token_ids)
+                        decode_len = len(req.output_token_ids)
+                        num_computed = int(req.num_computed_tokens)
+                        token_position = max(0, num_computed - 1)
+                        decode_step = max(0, token_position - prompt_len)
+
+                        num_blocks = max(
+                            1, math.ceil(num_computed / block_size))
+                        kv_cache_bytes_est = int(num_blocks * block_size *
+                                                 kv_bytes_per_token)
+                        kv_read_bytes_est = int(num_computed *
+                                                kv_bytes_per_token)
+                        kv_write_bytes_est = int(len(sampled_ids) *
+                                                 kv_bytes_per_token)
+
+                        if req_id not in self._ttft_ms:
+                            start_time = self._request_start_time.get(
+                                req_id, step_start)
+                            self._ttft_ms[req_id] = (step_end -
+                                                     start_time) * 1000.0
+                        last_time = self._last_decode_token_time.get(req_id)
+                        if last_time is None:
+                            per_token_latency_ms = step_latency_ms / max(
+                                1, len(sampled_ids))
+                        else:
+                            per_token_latency_ms = (step_end -
+                                                    last_time) * 1000.0 / max(
+                                                        1, len(sampled_ids))
+                        self._last_decode_token_time[req_id] = step_end
+
+                        self._record_request_trace({
+                            "record_type":
+                            "request_step",
+                            "phase":
+                            "decode",
+                            "request_id":
+                            req_id,
+                            "prefill_token_count":
+                            int(prompt_len),
+                            "decode_token_count":
+                            int(decode_len),
+                            "batch_size":
+                            int(batch_size),
+                            "num_concurrent_sequences":
+                            int(active_seq_count),
+                            "step_latency_ms":
+                            float(step_latency_ms),
+                            "per_token_latency_ms":
+                            float(per_token_latency_ms)
+                            if per_token_latency_ms is not None else None,
+                            "ttft_ms":
+                            float(self._ttft_ms.get(req_id))
+                            if req_id in self._ttft_ms else None,
+                            "token_position":
+                            int(token_position),
+                            "decode_step":
+                            int(decode_step),
+                            "kv_cache_bytes_est":
+                            kv_cache_bytes_est,
+                            "kv_read_bytes_est":
+                            kv_read_bytes_est,
+                            "kv_write_bytes_est":
+                            kv_write_bytes_est,
+                            "prompt_length_bucket":
+                            bucket_length(prompt_len),
+                            "output_length_bucket":
+                            bucket_length(decode_len),
+                            "routing_trace_step":
+                            (int(routing_trace_step)
+                             if routing_trace_step is not None else None),
+                        })
                 for output in (engine_core_outputs.items()
                                if engine_core_outputs else ()):
                     self._output_queue.put_nowait(output)

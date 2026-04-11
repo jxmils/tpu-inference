@@ -74,7 +74,9 @@ from tpu_inference.runner.lora_utils import LoraUtils
 from tpu_inference.runner.multimodal_manager import MultiModalManager
 from tpu_inference.runner.hbm_trace import HBMTraceWriter
 from tpu_inference.runner.moe_routing_trace import (RoutingTraceBatchMeta,
-                                                    RoutingTraceWriter)
+                                                    RoutingTraceWriter,
+                                                    _get_phase_per_req)
+from tpu_inference.runner.request_trace import RequestTraceWriter
 from tpu_inference.runner.persistent_batch_manager import \
     PersistentBatchManager
 from tpu_inference.runner.speculative_decoding_manager import (
@@ -260,6 +262,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._init_speculative_decoding()
         self._init_routing_trace()
         self._init_hbm_trace()
+        self._init_step_trace()
 
         # Delegate functions to specific manager classes.
         self.compilation_manager = CompilationManager(self)
@@ -309,6 +312,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if envs.CAPTURE_HBM_STATS and hbm_stats_dir:
             self._hbm_trace_writer = HBMTraceWriter(hbm_stats_dir,
                                                    rank=self.rank)
+
+    def _init_step_trace(self) -> None:
+        self._step_trace_writer: RequestTraceWriter | None = None
+        if envs.CAPTURE_REQUEST_STATS and envs.REQUEST_STATS_DIR:
+            self._step_trace_writer = RequestTraceWriter(
+                envs.REQUEST_STATS_DIR,
+                subdir="step",
+                filename_prefix="step_trace",
+                rank=self.rank,
+            )
 
     def _needs_trace_batch_meta(self) -> bool:
         return (self._routing_trace_writer is not None
@@ -389,6 +402,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return
         if routing_stats is None or self._routing_trace_batch_meta is None:
             return
+        self._persist_step_trace(routing_stats)
 
         self._routing_trace_writer.write(
             routing_stats,
@@ -399,6 +413,68 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             request_seq_ids=self._build_request_seq_ids(),
             phase_override=None,
         )
+
+    def _persist_step_trace(self, routing_stats: object) -> None:
+        if self._step_trace_writer is None or self._routing_trace_batch_meta is None:
+            return
+        aggregate = {}
+        if isinstance(routing_stats, dict):
+            aggregate = routing_stats.get("aggregate", {}) or {}
+
+        def _to_int(value):
+            if value is None:
+                return None
+            try:
+                return int(np.asarray(jax.device_get(value)))
+            except Exception:
+                try:
+                    return int(value)
+                except Exception:
+                    return None
+
+        def _to_sum(value):
+            if value is None:
+                return None
+            try:
+                arr = np.asarray(jax.device_get(value))
+                return int(arr.sum())
+            except Exception:
+                return None
+
+        dispatch_total = _to_int(aggregate.get("estimated_dispatch_bytes_total"))
+        return_total = _to_int(aggregate.get("estimated_return_bytes_total"))
+        a2a_total = _to_int(aggregate.get("a2a_bytes_total_sum"))
+        if a2a_total is None:
+            a2a_total = _to_sum(aggregate.get("a2a_bytes_total"))
+
+        phase_per_req = _get_phase_per_req(
+            self._routing_trace_batch_meta.num_computed_tokens,
+            self._routing_trace_batch_meta.num_prompt_tokens)
+        num_prefill = int(np.sum(phase_per_req))
+        num_decode = len(self._routing_trace_batch_meta.req_ids) - num_prefill
+
+        self._step_trace_writer.write({
+            "record_type":
+            "step_summary",
+            "trace_step":
+            self._routing_trace_step,
+            "batch_id":
+            self._routing_trace_step,
+            "num_reqs":
+            int(len(self._routing_trace_batch_meta.req_ids)),
+            "num_tokens":
+            int(np.sum(self._routing_trace_batch_meta.token_mask)),
+            "num_prefill_reqs":
+            num_prefill,
+            "num_decode_reqs":
+            num_decode,
+            "estimated_dispatch_bytes_total":
+            dispatch_total,
+            "estimated_return_bytes_total":
+            return_total,
+            "a2a_bytes_total_sum":
+            a2a_total,
+        })
 
     def _init_random(self):
         if self.model_config.seed is None:
