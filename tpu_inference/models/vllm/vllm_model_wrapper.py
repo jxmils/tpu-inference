@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import inspect
 import time
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -62,6 +63,48 @@ from tpu_inference.models.vllm.vllm_model_wrapper_context import (
 from tpu_inference.runner.lora_utils import replace_lora_metadata
 
 logger = init_logger(__name__)
+
+
+def _patch_pallas_attention_output_block_scale() -> None:
+    """Make vLLM/Pallas attention forward compatible with older torchax."""
+    try:
+        import importlib
+
+        candidate_modules = (
+            "vllm.model_executor.layers.attention.backends.pallas",
+            "vllm.model_executor.layers.attention.backends.pallas_attn",
+            "vllm.model_executor.layers.attention.backends.pallas_attention",
+        )
+        cls = None
+        for mod_name in candidate_modules:
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception:
+                continue
+            if hasattr(mod, "PallasAttentionBackendImpl"):
+                cls = getattr(mod, "PallasAttentionBackendImpl")
+                break
+        if cls is None:
+            return
+        if "output_block_scale" in inspect.signature(cls.forward).parameters:
+            return
+
+        original_forward = cls.forward
+
+        def _forward(self, *args, output_block_scale=None, **kwargs):
+            return original_forward(self, *args, **kwargs)
+
+        cls.forward = _forward
+        logger.warning(
+            "Patched PallasAttentionBackendImpl.forward to ignore "
+            "output_block_scale for compatibility with older torchax.")
+    except Exception:
+        logger.warning(
+            "Failed to apply Pallas attention compatibility patch.",
+            exc_info=True)
+
+
+_patch_pallas_attention_output_block_scale()
 
 
 def _aggregate_routing_stats(per_layer_stats: List[dict | None]) -> dict:
