@@ -14,7 +14,7 @@ from tpu_inference.logger import init_logger
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
     from vllm.config.cache import BlockSize
-    from vllm.inputs import ProcessorInputs, PromptType
+    from vllm.inputs import ProcessorInputs
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams, SamplingType
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -27,7 +27,6 @@ else:
     AttentionBackendEnum = None
     SamplingParams = None
     SamplingType = None
-    PromptType = None
     ProcessorInputs = None
 
 logger = init_logger(__name__)
@@ -245,11 +244,14 @@ class TpuPlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        prompt: PromptType,
-        params: Union["SamplingParams", PoolingParams],
         processed_inputs: ProcessorInputs,
+        params: Union["SamplingParams", PoolingParams],
     ) -> None:
-        """Raises if this request is unsupported on this platform"""
+        """Raises if this request is unsupported on this platform.
+
+        Matches vLLM v1 ``input_processor`` which calls
+        ``platform.validate_request(processed_inputs, params)``.
+        """
         from vllm.sampling_params import SamplingParams, SamplingType
 
         if isinstance(params, SamplingParams):

@@ -26,8 +26,9 @@ def _as_i32(value) -> jax.Array:
     return jnp.asarray(value, dtype=jnp.int32)
 
 
-def _as_i64(value) -> jax.Array:
-    return jnp.asarray(value, dtype=jnp.int64)
+def _as_f32(value) -> jax.Array:
+    """float32 byte math: avoids int64 on TPU default JAX (see JAX_ENABLE_X64)."""
+    return jnp.asarray(value, dtype=jnp.float32)
 
 
 def _compute_unique_token_counts(topk_experts: jax.Array,
@@ -68,10 +69,10 @@ def _assemble_stats(
     else:
         unique_token_counts = jnp.zeros((num_experts, ), dtype=jnp.int32)
 
-    bytes_per_token = _as_i64(hidden_size * bytes_per_element)
-    expert_counts_i64 = expert_counts.astype(jnp.int64)
-    estimated_dispatch_bytes = expert_counts_i64 * bytes_per_token
-    estimated_return_bytes = expert_counts_i64 * bytes_per_token
+    bytes_per_token = _as_f32(hidden_size * bytes_per_element)
+    expert_counts_f = expert_counts.astype(jnp.float32)
+    estimated_dispatch_bytes = expert_counts_f * bytes_per_token
+    estimated_return_bytes = expert_counts_f * bytes_per_token
 
     stats: Dict[str, jax.Array] = {
         "layer_idx": _as_i32(-1 if layer_idx is None else layer_idx),
@@ -89,9 +90,9 @@ def _assemble_stats(
         "bytes_per_token": bytes_per_token,
         "estimated_dispatch_bytes": estimated_dispatch_bytes,
         "estimated_return_bytes": estimated_return_bytes,
-        "estimated_dispatch_bytes_total": _as_i64(
+        "estimated_dispatch_bytes_total": _as_f32(
             jnp.sum(estimated_dispatch_bytes)),
-        "estimated_return_bytes_total": _as_i64(
+        "estimated_return_bytes_total": _as_f32(
             jnp.sum(estimated_return_bytes)),
         "routing_is_exact": _as_i32(1 if routing_is_exact else 0),
     }
@@ -105,7 +106,7 @@ def _assemble_stats(
                                     length=num_expert_parallelism)
         a2a_counts = jax.lax.all_gather(local_counts, axis_name=data_axis_name)
         stats["a2a_counts"] = a2a_counts
-        stats["a2a_bytes"] = a2a_counts.astype(jnp.int64) * bytes_per_token
+        stats["a2a_bytes"] = a2a_counts.astype(jnp.float32) * bytes_per_token
         stats["a2a_num_expert_shards"] = _as_i32(num_expert_parallelism)
 
     if include_router_logits and router_logits is not None:
