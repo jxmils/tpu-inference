@@ -126,6 +126,68 @@ def _patch_pallas_attention_output_block_scale() -> None:
 _patch_pallas_attention_output_block_scale()
 
 
+def _patch_unified_attention_output_block_scale() -> None:
+    """Drop output_block_scale when the backend doesn't accept it."""
+    try:
+        import importlib
+
+        attn_mod = importlib.import_module(
+            "vllm.model_executor.layers.attention.attention")
+        if getattr(attn_mod, "_tpu_inference_obs_patch", False):
+            return
+
+        def _supports_output_block_scale(impl_forward) -> bool:
+            sig = inspect.signature(impl_forward)
+            if "output_block_scale" in sig.parameters:
+                return True
+            return any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in sig.parameters.values())
+
+        def _wrapped(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            output: torch.Tensor,
+            layer_name: Any,
+            output_scale: torch.Tensor | None = None,
+            output_block_scale: torch.Tensor | None = None,
+            kv_cache_dummy_dep: torch.Tensor | None = None,
+        ) -> None:
+            del kv_cache_dummy_dep
+            layer_name = attn_mod._resolve_layer_name(layer_name)
+            attn_metadata, self, kv_cache, _ = attn_mod.get_attention_context(
+                layer_name)
+            kwargs = {
+                "output": output,
+                "output_scale": output_scale,
+            }
+            if _supports_output_block_scale(self.impl.forward):
+                kwargs["output_block_scale"] = output_block_scale
+            self.impl.forward(
+                self,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                **kwargs,
+            )
+
+        attn_mod.unified_attention_with_output = _wrapped
+        attn_mod._tpu_inference_obs_patch = True
+        logger.warning(
+            "Patched unified_attention_with_output to drop output_block_scale "
+            "when unsupported by the backend.")
+    except Exception:
+        logger.warning(
+            "Failed to apply unified attention compatibility patch.",
+            exc_info=True)
+
+
+_patch_unified_attention_output_block_scale()
+
+
 def _aggregate_routing_stats(per_layer_stats: List[dict | None]) -> dict:
     present = [stats for stats in per_layer_stats if stats is not None]
     if not present:

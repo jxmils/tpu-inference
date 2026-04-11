@@ -43,10 +43,13 @@ WORKDIR /workspace/vllm
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_COMMIT_HASH
 
+COPY docker/patches/patch_vllm_attention_output_block_scale.py /tmp/patch_vllm_attention_output_block_scale.py
+
 RUN git clone $VLLM_REPO . && \
     if [ -n "$VLLM_COMMIT_HASH" ]; then \
         git checkout $VLLM_COMMIT_HASH; \
     fi
+RUN python /tmp/patch_vllm_attention_output_block_scale.py
 
 RUN --mount=type=cache,target=/root/.cache/pip pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements/tpu.txt --retries 3
 RUN --mount=type=cache,target=/root/.cache/pip VLLM_TARGET_DEVICE="tpu" pip install -e .
