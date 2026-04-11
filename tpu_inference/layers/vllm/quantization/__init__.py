@@ -29,7 +29,10 @@ except Exception:  # pragma: no cover - depends on vLLM import compatibility.
     VllmCompressedTensorsConfig = None
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.layers.vllm.quantization.fp8 import VllmFp8Config
-from tpu_inference.layers.vllm.quantization.mxfp4 import VllmMxfp4Config
+try:
+    from tpu_inference.layers.vllm.quantization.mxfp4 import VllmMxfp4Config
+except Exception:  # pragma: no cover - depends on vLLM import compatibility.
+    VllmMxfp4Config = None
 from tpu_inference.layers.vllm.quantization.unquantized import \
     VllmUnquantizedConfig
 
@@ -54,6 +57,8 @@ def get_tpu_quantization_config(vllm_config: VllmConfig,
     }
     if VllmCompressedTensorsConfig is not None:
         method_to_config[quant_methods.COMPRESSED_TENSORS] = VllmCompressedTensorsConfig
+    if VllmMxfp4Config is None:
+        method_to_config.pop(quant_methods.MXFP4, None)
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(
             f"{model_config.quantization} quantization method not supported."
