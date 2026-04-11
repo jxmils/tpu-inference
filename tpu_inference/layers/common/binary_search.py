@@ -184,6 +184,10 @@ def topk_mask(x: jnp.ndarray, k: int, replace_val: jnp.ndarray) -> jnp.ndarray:
       masked version of x. [batch..., vocab_size]
     """
     batch_shape = tuple(list(x.shape)[:-1])  # [batch...]
+    # TPU kernels in this file are int32-centric. With JAX x64 enabled, integer
+    # reductions may produce int64 values which can map to an extra lane
+    # dimension on TPU and break broadcasting in the predicate.
+    k = jnp.asarray(k, dtype=jnp.int32)
 
     x_for_loop = x
     reduce_axis = x.ndim - 1
@@ -212,7 +216,8 @@ def topk_mask(x: jnp.ndarray, k: int, replace_val: jnp.ndarray) -> jnp.ndarray:
         # threshold: [batch..., 1, last_batch]
 
         # count_ge: [batch...]
-        count_gt = jnp.sum(x_for_loop > threshold, axis=reduce_axis)
+        count_gt = jnp.sum(
+            x_for_loop > threshold, axis=reduce_axis, dtype=jnp.int32)
 
         return count_gt >= k
 
