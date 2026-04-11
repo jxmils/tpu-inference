@@ -69,18 +69,37 @@ def _patch_pallas_attention_output_block_scale() -> None:
     """Make vLLM/Pallas attention forward compatible with older torchax."""
     try:
         import importlib
+        import pkgutil
 
+        modules = []
         candidate_modules = (
             "vllm.model_executor.layers.attention.backends.pallas",
             "vllm.model_executor.layers.attention.backends.pallas_attn",
             "vllm.model_executor.layers.attention.backends.pallas_attention",
         )
-        cls = None
         for mod_name in candidate_modules:
             try:
-                mod = importlib.import_module(mod_name)
+                modules.append(importlib.import_module(mod_name))
             except Exception:
                 continue
+
+        try:
+            import vllm.model_executor.layers.attention.backends as backends
+        except Exception:
+            backends = None
+
+        if backends is not None and hasattr(backends, "__path__"):
+            for modinfo in pkgutil.walk_packages(
+                    backends.__path__, backends.__name__ + "."):
+                if "pallas" not in modinfo.name:
+                    continue
+                try:
+                    modules.append(importlib.import_module(modinfo.name))
+                except Exception:
+                    continue
+
+        cls = None
+        for mod in modules:
             if hasattr(mod, "PallasAttentionBackendImpl"):
                 cls = getattr(mod, "PallasAttentionBackendImpl")
                 break
