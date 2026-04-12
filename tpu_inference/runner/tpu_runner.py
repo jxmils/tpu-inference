@@ -16,6 +16,7 @@ import copy
 import functools
 import logging
 import random
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
@@ -291,6 +292,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.is_pooling_model: bool = self.model_config.runner_type == "pooling"
         """Generative model or pooling model select different computations."""
+        # Wall time for the last `model_fn` call (host); pair with step trace bytes
+        # for effective-bandwidth proxies (e.g. a2a_bytes / s).
+        self._last_model_forward_wall_time_s: float | None = None
         self._persist_hbm_snapshot("runner_initialized")
 
     def _init_routing_trace(self) -> None:
@@ -474,6 +478,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return_total,
             "a2a_bytes_total_sum":
             a2a_total,
+            "model_forward_wall_time_s":
+            self._last_model_forward_wall_time_s,
         })
 
     def _init_random(self):
@@ -1002,6 +1008,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output) as kv_connector_output:
                 # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
                 # but one of them would be `None`
+                _t_model_fn = time.perf_counter()
                 (self.kv_caches, hidden_states,
                  aux_hidden_states) = self.model_fn(
                      self.state,
@@ -1016,6 +1023,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      self.is_first_rank,
                      self.is_last_rank,
                  )
+                self._last_model_forward_wall_time_s = (
+                    time.perf_counter() - _t_model_fn)
             routing_stats = None
             if isinstance(aux_hidden_states, tuple) and len(
                     aux_hidden_states) == 2:
