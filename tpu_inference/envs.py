@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     REQUEST_STATS_DIR: str
     MOE_ROUTING_STATS_SAVE_RAW: bool = True
     MOE_ROUTING_STATS_SAVE_SUMMARY: bool = True
+    TRACE_STEP_STRIDE: int = 1
     NUM_SLICES: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
@@ -147,6 +148,21 @@ def moe_routing_stats_dir() -> str:
     return DEFAULT_MOE_ROUTING_STATS_DIR
 
 
+def trace_step_stride() -> int:
+    """Persist traces every N steps (1 means capture every step)."""
+    raw = os.getenv("TRACE_STEP_STRIDE", "1")
+    try:
+        v = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid TRACE_STEP_STRIDE={raw!r}; expected positive integer."
+        ) from exc
+    if v <= 0:
+        raise ValueError(
+            f"Invalid TRACE_STEP_STRIDE={v}; expected positive integer.")
+    return v
+
+
 def hbm_stats_enabled() -> bool:
     if "CAPTURE_HBM_STATS" not in os.environ:
         return True
@@ -259,6 +275,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Persist compact per-layer/per-expert summaries in JSONL.
     "MOE_ROUTING_STATS_SAVE_SUMMARY":
     env_bool("MOE_ROUTING_STATS_SAVE_SUMMARY", default=True),
+    # Persist routing/HBM/request traces every N trace steps.
+    "TRACE_STEP_STRIDE":
+    trace_step_stride,
     # Number of TPU slices for multi-slice mesh
     "NUM_SLICES":
     lambda: int(os.getenv("NUM_SLICES") or "1"),

@@ -295,6 +295,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Wall time for the last `model_fn` call (host); pair with step trace bytes
         # for effective-bandwidth proxies (e.g. a2a_bytes / s).
         self._last_model_forward_wall_time_s: float | None = None
+        self._trace_step_stride = int(envs.TRACE_STEP_STRIDE)
         self._persist_hbm_snapshot("runner_initialized")
 
     def _init_routing_trace(self) -> None:
@@ -373,6 +374,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                               extra: Optional[Dict[str, Any]] = None) -> None:
         if self._hbm_trace_writer is None:
             return
+        if not self._should_persist_current_trace_step():
+            return
         if sync_obj is not None:
             self._block_until_ready_for_hbm(sync_obj)
         hbm_usage = common_utils.hbm_usage_bytes(self.devices)
@@ -400,11 +403,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return
         self._routing_trace_step += 1
 
+    def _should_persist_current_trace_step(self) -> bool:
+        stride = max(int(self._trace_step_stride), 1)
+        return (self._routing_trace_step % stride) == 0
+
     def _persist_routing_stats(self, routing_stats: object,
                                scheduler_output: "VllmSchedulerOutput") -> None:
         if self._routing_trace_writer is None:
             return
         if routing_stats is None or self._routing_trace_batch_meta is None:
+            return
+        if not self._should_persist_current_trace_step():
             return
         self._persist_step_trace(routing_stats, scheduler_output)
 
