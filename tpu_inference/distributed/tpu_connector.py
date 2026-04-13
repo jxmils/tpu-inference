@@ -143,6 +143,15 @@ class _kv_transfer_params:
 class TPUConnectorMetadata(KVConnectorMetadata):
     reqs_to_send: dict[ReqId, SendMeta] = field(default_factory=dict)
     reqs_to_load: dict[ReqId, LoadMeta] = field(default_factory=dict)
+    # Decode-side KV loading stats for this scheduler step.
+    kv_external_load_reqs: int = 0
+    kv_local_hit_reqs: int = 0
+    kv_pull_done_reqs: int = 0
+    kv_external_load_tokens: int = 0
+    kv_external_block_refs_total: int = 0
+    kv_hot_block_ids_gt1: int = 0
+    kv_hot_block_total_refs: int = 0
+    kv_hot_block_max_fanout: int = 0
 
 
 class TPUConnector(KVConnectorBase_V1):
@@ -261,6 +270,16 @@ class TPUConnectorScheduler():
         logger.info(
             f"TPUConnectorScheduler --> kv_ip={self.kv_ip} | kv_port={self.kv_port}"
         )
+        # Requests that previously required external load and are waiting to
+        # report pull completion.
+        self._req_ids_waiting_pull_done: set[ReqId] = set()
+        self._reset_step_kv_stats()
+
+    def _reset_step_kv_stats(self) -> None:
+        self._step_kv_external_load_reqs = 0
+        self._step_kv_local_hit_reqs = 0
+        self._step_kv_pull_done_reqs = 0
+        self._step_kv_external_load_tokens = 0
 
     def get_num_new_matched_tokens(
         self,
@@ -318,6 +337,9 @@ class TPUConnectorScheduler():
 
         params = request.kv_transfer_params
         if num_external_tokens > 0:
+            self._step_kv_external_load_reqs += 1
+            self._step_kv_external_load_tokens += int(num_external_tokens)
+            self._req_ids_waiting_pull_done.add(request.request_id)
             # We need to load KV-cache from remote (partial prefix cache hit).
             local_block_ids = blocks.get_block_ids()[0]
 
@@ -343,6 +365,11 @@ class TPUConnectorScheduler():
             # 1. We don't need to load KV-cache from remote because of full local cache.
             # 2. The async pulling is done.
             # In both cases we need to send notification to let P free memory.
+            if request.request_id in self._req_ids_waiting_pull_done:
+                self._step_kv_pull_done_reqs += 1
+                self._req_ids_waiting_pull_done.discard(request.request_id)
+            else:
+                self._step_kv_local_hit_reqs += 1
             self.reqs_to_load[request.request_id] = LoadMeta(
                 uuid=params["uuid"],
                 local_block_ids=None,
@@ -368,7 +395,27 @@ class TPUConnectorScheduler():
             self.reqs_to_send = {}
         else:
             meta.reqs_to_load = self.reqs_to_load
+            meta.kv_external_load_reqs = int(self._step_kv_external_load_reqs)
+            meta.kv_local_hit_reqs = int(self._step_kv_local_hit_reqs)
+            meta.kv_pull_done_reqs = int(self._step_kv_pull_done_reqs)
+            meta.kv_external_load_tokens = int(self._step_kv_external_load_tokens)
+            block_ref_counts: dict[int, int] = {}
+            for req_meta in self.reqs_to_load.values():
+                remote_block_ids = req_meta.remote_block_ids
+                if remote_block_ids is None:
+                    continue
+                for blk in remote_block_ids:
+                    blk_i = int(blk)
+                    block_ref_counts[blk_i] = block_ref_counts.get(blk_i, 0) + 1
+            if block_ref_counts:
+                hot_counts = [c for c in block_ref_counts.values() if c > 1]
+                meta.kv_external_block_refs_total = int(
+                    sum(block_ref_counts.values()))
+                meta.kv_hot_block_ids_gt1 = int(len(hot_counts))
+                meta.kv_hot_block_total_refs = int(sum(hot_counts))
+                meta.kv_hot_block_max_fanout = int(max(block_ref_counts.values()))
             self.reqs_to_load = {}
+            self._reset_step_kv_stats()
 
         return meta
 

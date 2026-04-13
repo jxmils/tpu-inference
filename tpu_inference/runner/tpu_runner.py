@@ -406,7 +406,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return
         if routing_stats is None or self._routing_trace_batch_meta is None:
             return
-        self._persist_step_trace(routing_stats)
+        self._persist_step_trace(routing_stats, scheduler_output)
 
         self._routing_trace_writer.write(
             routing_stats,
@@ -418,7 +418,42 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             phase_override=None,
         )
 
-    def _persist_step_trace(self, routing_stats: object) -> None:
+    def _extract_kv_connector_stats(self,
+                                    scheduler_output: "VllmSchedulerOutput"
+                                    ) -> dict[str, float | int | None]:
+        meta = getattr(scheduler_output, "kv_connector_metadata", None)
+        if meta is None:
+            return {}
+        ext_reqs = int(getattr(meta, "kv_external_load_reqs", 0) or 0)
+        hit_reqs = int(getattr(meta, "kv_local_hit_reqs", 0) or 0)
+        pull_done_reqs = int(getattr(meta, "kv_pull_done_reqs", 0) or 0)
+        ext_tokens = int(getattr(meta, "kv_external_load_tokens", 0) or 0)
+        block_refs = int(getattr(meta, "kv_external_block_refs_total", 0) or 0)
+        hot_ids = int(getattr(meta, "kv_hot_block_ids_gt1", 0) or 0)
+        hot_refs = int(getattr(meta, "kv_hot_block_total_refs", 0) or 0)
+        hot_max_fanout = int(getattr(meta, "kv_hot_block_max_fanout", 0) or 0)
+        miss_hit_den = ext_reqs + hit_reqs
+        hot_ref_ratio = (float(hot_refs) / float(block_refs)
+                         if block_refs > 0 else None)
+        pull_hit_ratio = (float(ext_reqs) / float(hit_reqs)
+                          if hit_reqs > 0 else None)
+        return {
+            "kv_external_load_reqs": ext_reqs,
+            "kv_local_hit_reqs": hit_reqs,
+            "kv_pull_done_reqs": pull_done_reqs,
+            "kv_external_load_tokens": ext_tokens,
+            "kv_miss_hit_ratio": (float(ext_reqs) / float(miss_hit_den)
+                                  if miss_hit_den > 0 else None),
+            "kv_pull_to_hit_ratio": pull_hit_ratio,
+            "kv_external_block_refs_total": block_refs,
+            "kv_hot_block_ids_gt1": hot_ids,
+            "kv_hot_block_total_refs": hot_refs,
+            "kv_hot_block_max_fanout": hot_max_fanout,
+            "kv_hot_block_ref_ratio": hot_ref_ratio,
+        }
+
+    def _persist_step_trace(self, routing_stats: object,
+                            scheduler_output: "VllmSchedulerOutput") -> None:
         if self._step_trace_writer is None or self._routing_trace_batch_meta is None:
             return
         aggregate = {}
@@ -457,7 +492,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         num_prefill = int(np.sum(phase_per_req))
         num_decode = len(self._routing_trace_batch_meta.req_ids) - num_prefill
 
-        self._step_trace_writer.write({
+        rec = {
             "record_type":
             "step_summary",
             "trace_step":
@@ -480,7 +515,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             a2a_total,
             "model_forward_wall_time_s":
             self._last_model_forward_wall_time_s,
-        })
+        }
+        rec.update(self._extract_kv_connector_stats(scheduler_output))
+        self._step_trace_writer.write(rec)
 
     def _init_random(self):
         if self.model_config.seed is None:

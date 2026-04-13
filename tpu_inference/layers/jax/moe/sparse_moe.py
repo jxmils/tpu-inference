@@ -48,11 +48,27 @@ def sparse_moe_distributed_fwd(
     kernel_gating: jax.Array,
     kernel_up_proj: jax.Array,
     kernel_down_proj: jax.Array,
+    *,
+    capture_ep_ragged_a2a: bool = False,
 ):
     """
     The sparse MoE forward pass with fully distributed logic.
     This assumes it is running within a distributed TPU.
+
+    When capture_ep_ragged_a2a is True (Megablox EP, batch sharded by expert),
+    also returns shard×shard token counts implied by ragged_all_to_all send_sizes
+    (dispatch and return collectives), and matching byte volumes using hidden
+    activations dtype × hidden_size.
     """
+    nep = max(1, moe_instance.num_expert_parallelism)
+    ep_dispatch_counts = jnp.zeros((nep, nep), dtype=jnp.int32)
+    ep_return_counts = jnp.zeros((nep, nep), dtype=jnp.int32)
+    bpe = jnp.asarray(
+        moe_instance.hidden_size * jnp.dtype(x_TD.dtype).itemsize,
+        dtype=jnp.float32,
+    )
+    ep_dispatch_bytes = jnp.zeros((nep, nep), dtype=jnp.float32)
+    ep_return_bytes = jnp.zeros((nep, nep), dtype=jnp.float32)
 
     # 1. Global Permute
     (
@@ -79,7 +95,7 @@ def sparse_moe_distributed_fwd(
                     moe_instance.num_expert_parallelism, local_expert_size),
                 axis=2)
 
-            input_offsets, send_sizes, output_offsets, recv_sizes = get_all_to_all_params_fn(
+            input_offsets_fwd, send_sizes_fwd, output_offsets_fwd, recv_sizes_fwd = get_all_to_all_params_fn(
                 all_shards_group_sizes_per_expert_shard, expert_shard_id,
                 moe_instance.num_expert_parallelism)
 
@@ -90,13 +106,23 @@ def sparse_moe_distributed_fwd(
                 (global_total_assignments, moe_instance.hidden_size),
                 dtype=sorted_inputs.dtype)
 
+            if capture_ep_ragged_a2a and moe_instance.expert_axis_name is not None:
+                ep_dispatch_counts = jax.lax.all_gather(
+                    send_sizes_fwd,
+                    axis_name=moe_instance.expert_axis_name,
+                    axis=0,
+                    tiled=False,
+                )
+                ep_dispatch_bytes = (ep_dispatch_counts.astype(jnp.float32) *
+                                     bpe)
+
             inputs_after_all2all = jax.lax.ragged_all_to_all(
                 sorted_inputs,
                 output_shape_est,
-                input_offsets,
-                send_sizes,
-                output_offsets,
-                recv_sizes,
+                input_offsets_fwd,
+                send_sizes_fwd,
+                output_offsets_fwd,
+                recv_sizes_fwd,
                 axis_name=moe_instance.expert_axis_name)
 
             # 3a. Local Permute
@@ -190,18 +216,27 @@ def sparse_moe_distributed_fwd(
             local_output = sort_activations_fn(
                 intermediate_output, jnp.argsort(local_sorted_indices))
 
-            input_offsets, send_sizes, output_offsets, recv_sizes = get_all_to_all_params_fn(
+            input_offsets_ret, send_sizes_ret, output_offsets_ret, recv_sizes_ret = get_all_to_all_params_fn(
                 jnp.transpose(all_shards_group_sizes),
                 expert_shard_id,
                 moe_instance.num_expert_parallelism,
             )
+            if capture_ep_ragged_a2a and moe_instance.expert_axis_name is not None:
+                ep_return_counts = jax.lax.all_gather(
+                    send_sizes_ret,
+                    axis_name=moe_instance.expert_axis_name,
+                    axis=0,
+                    tiled=False,
+                )
+                ep_return_bytes = ep_return_counts.astype(jnp.float32) * bpe
+
             final_intermediate_output = jax.lax.ragged_all_to_all(
                 local_output,
                 output_shape,
-                input_offsets,
-                send_sizes,
-                output_offsets,
-                recv_sizes,
+                input_offsets_ret,
+                send_sizes_ret,
+                output_offsets_ret,
+                recv_sizes_ret,
                 axis_name=moe_instance.expert_axis_name)
         else:
             input_offsets, send_sizes, output_offsets, recv_sizes = get_all_to_all_params_fn(
@@ -228,12 +263,19 @@ def sparse_moe_distributed_fwd(
                                  moe_instance.num_experts_per_tok,
                                  moe_instance.dtype)
 
-    return output_TD
+    return (output_TD, ep_dispatch_counts, ep_return_counts, ep_dispatch_bytes,
+            ep_return_bytes)
 
 
-def sparse_moe_func(weights: UnfusedMoEWeights, x_TD: jax.Array,
-                    gating_output: Tuple[jax.Array, jax.Array],
-                    layer: Union[FusedMoE, JaxMoE], mesh: Mesh) -> jax.Array:
+def sparse_moe_func(
+    weights: UnfusedMoEWeights,
+    x_TD: jax.Array,
+    gating_output: Tuple[jax.Array, jax.Array],
+    layer: Union[FusedMoE, JaxMoE],
+    mesh: Mesh,
+    *,
+    capture_ep_ragged_a2a: bool = False,
+) -> Union[jax.Array, Tuple[jax.Array, dict]]:
     assert isinstance(
         weights, UnfusedMoEWeights), "Expected unfused weights for sparse MoE!"
     weights_TX, indices_TX = gating_output
@@ -255,13 +297,24 @@ def sparse_moe_func(weights: UnfusedMoEWeights, x_TD: jax.Array,
         gating_up_proj_spec,  # Sharded up-projection kernel
         down_proj_spec,  # Sharded down-projection kernel
     )
-    out_specs = PartitionSpec(*layer.activation_ffw_td)
+    e_axis = layer.expert_axis_name
+    matrix_pspec = PartitionSpec(e_axis if e_axis is not None else None, None)
+    out_specs = (
+        PartitionSpec(*layer.activation_ffw_td),
+        matrix_pspec,
+        matrix_pspec,
+        matrix_pspec,
+        matrix_pspec,
+    )
 
-    mapped_moe_fwd = partial(jax.experimental.shard_map.shard_map,
-                             mesh=mesh,
-                             in_specs=in_specs,
-                             out_specs=out_specs,
-                             check_rep=False)(sparse_moe_distributed_fwd)
+    mapped_moe_fwd = partial(
+        jax.experimental.shard_map.shard_map,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_rep=False)(
+            partial(sparse_moe_distributed_fwd,
+                    capture_ep_ragged_a2a=capture_ep_ragged_a2a))
 
     # TODO (jacobplatin): this is needed because of issues with Qwix quantizing the `shard_map` in SpraseMatmul
     # Basically, during the abstract pass, we need to manually quantize the weights here for Qwix, but we'll
@@ -290,9 +343,24 @@ def sparse_moe_func(weights: UnfusedMoEWeights, x_TD: jax.Array,
     weights.w2_weight = kernel_up_proj_EDF
     weights.w3_weight = kernel_down_proj_EFD
     # TODO (jacobplatin): support quantization
-    return mapped_moe_fwd(layer, x_TD, weights_TX, indices_TX,
-                          weights.w1_weight, weights.w2_weight,
-                          weights.w3_weight)
+    (out_td, ep_dispatch_counts, ep_return_counts, ep_dispatch_bytes,
+     ep_return_bytes) = mapped_moe_fwd(layer, x_TD, weights_TX, indices_TX,
+                                       weights.w1_weight, weights.w2_weight,
+                                       weights.w3_weight)
+    if not capture_ep_ragged_a2a:
+        return out_td
+    return out_td, {
+        "ep_ragged_a2a_dispatch_counts":
+        ep_dispatch_counts,
+        "ep_ragged_a2a_return_counts":
+        ep_return_counts,
+        "ep_ragged_a2a_dispatch_bytes":
+        ep_dispatch_bytes,
+        "ep_ragged_a2a_return_bytes":
+        ep_return_bytes,
+        "ep_ragged_a2a_routing_is_exact":
+        jnp.asarray(1, dtype=jnp.int32),
+    }
 
 
 def _process_weight_for_qwix(

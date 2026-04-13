@@ -76,7 +76,9 @@ def moe_apply(
     moe_backend: MoEBackend,
     mesh: Mesh,
     extra_backend_kwargs: dict,
-) -> jax.Array:
+    *,
+    capture_ep_ragged_a2a: bool = False,
+) -> Union[jax.Array, Tuple[jax.Array, dict]]:
 
     with jax.named_scope(layer._get_name()):
         activation = layer.activation if isinstance(
@@ -169,6 +171,7 @@ def moe_apply(
                                        x_TD=x,
                                        gating_output=gating_output,
                                        layer=layer,
-                                       mesh=mesh)
+                                       mesh=mesh,
+                                       capture_ep_ragged_a2a=capture_ep_ragged_a2a)
 
         return output

@@ -107,14 +107,16 @@ class RoutingTraceWriter:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         rank_suffix = f"_rank{rank}" if rank is not None else ""
         suffix = f"step{trace_step}_batch{batch_id}{rank_suffix}_{timestamp}"
+        # Wall time at capture (same for raw + summary) for multi-rank / multi-host alignment.
+        timestamp_unix = time.time()
 
         if self.save_raw:
             self._write_raw_npz(per_layer_np, aggregate_np, batch_meta, suffix,
-                                trace_step, batch_id, rank)
+                                trace_step, batch_id, rank, timestamp_unix)
         if self.save_summary:
             self._write_summary_jsonl(per_layer_np, batch_meta, suffix,
                                       request_seq_ids, phase_override,
-                                      trace_step, batch_id, rank)
+                                      trace_step, batch_id, rank, timestamp_unix)
 
         self._run_invariants(per_layer_np, aggregate_np, batch_meta)
 
@@ -122,7 +124,7 @@ class RoutingTraceWriter:
                        aggregate: Dict[str, Any],
                        batch_meta: RoutingTraceBatchMeta, suffix: str,
                        trace_step: int, batch_id: int,
-                       rank: int | None) -> None:
+                       rank: int | None, timestamp_unix: float) -> None:
         raw_path = os.path.join(self._raw_dir,
                                 f"routing_raw_{suffix}.npz")
 
@@ -147,6 +149,8 @@ class RoutingTraceWriter:
             np.asarray([batch_id], dtype=np.int64),
             "rank":
             np.asarray([-1 if rank is None else rank], dtype=np.int32),
+            "timestamp_unix":
+            np.asarray([timestamp_unix], dtype=np.float64),
         }
 
         if aggregate:
@@ -174,7 +178,7 @@ class RoutingTraceWriter:
                              request_seq_ids: Dict[str, Any] | None,
                              phase_override: Optional[str],
                              trace_step: int, batch_id: int,
-                             rank: int | None) -> None:
+                             rank: int | None, timestamp_unix: float) -> None:
         summary_path = os.path.join(self._summary_dir,
                                     f"routing_summary_{suffix}.jsonl")
 
@@ -268,6 +272,8 @@ class RoutingTraceWriter:
                             batch_id,
                             "rank":
                             rank,
+                            "timestamp_unix":
+                            timestamp_unix,
                             "phase":
                             phase,
                             "request_id":

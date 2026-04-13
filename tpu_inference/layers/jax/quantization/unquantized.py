@@ -223,9 +223,26 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                     in (MoEBackend.GMM_EP, MoEBackend.GMM_TP),
                 )
 
-        output = moe_apply(layer, x_TD, router_logits, weights,
-                           layer.moe_backend, layer.mesh,
-                           self.extra_backend_kwargs)
+        capture_ep_ragged = (
+            capture_routing_stats
+            and layer.moe_backend == MoEBackend.MEGABLX_GMM
+            and envs.moe_ep_ragged_a2a_matrix_enabled()
+        )
+        moe_out = moe_apply(
+            layer,
+            x_TD,
+            router_logits,
+            weights,
+            layer.moe_backend,
+            layer.mesh,
+            self.extra_backend_kwargs,
+            capture_ep_ragged_a2a=capture_ep_ragged,
+        )
+        if capture_ep_ragged and isinstance(moe_out, tuple):
+            output, ep_extra = moe_out
+            routing_stats = {**routing_stats, **ep_extra}
+        else:
+            output = moe_out
         if capture_routing_stats:
             return output, routing_stats
         return output

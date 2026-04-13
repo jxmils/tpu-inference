@@ -136,6 +136,11 @@ def moe_routing_a2a_enabled() -> bool:
     return env_bool("CAPTURE_MOE_ROUTING_A2A", default=True)()
 
 
+def moe_ep_ragged_a2a_matrix_enabled() -> bool:
+    """If True, Megablox EP path records shard×shard ragged all-to-all byte matrices."""
+    return env_bool("CAPTURE_MOE_EP_RAGGED_A2A", default=False)()
+
+
 def moe_routing_stats_dir() -> str:
     if "MOE_ROUTING_STATS_DIR" in os.environ:
         return os.getenv("MOE_ROUTING_STATS_DIR") or ""
@@ -230,6 +235,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Capture device-level A2A routing matrix (data shard -> expert shard).
     "CAPTURE_MOE_ROUTING_A2A":
     moe_routing_a2a_enabled,
+    # Expert-parallel ragged all-to-all peer matrices (Megablox path; uses send_sizes).
+    "CAPTURE_MOE_EP_RAGGED_A2A":
+    moe_ep_ragged_a2a_matrix_enabled,
     # Output directory for MoE routing traces (empty disables persistence).
     "MOE_ROUTING_STATS_DIR":
     moe_routing_stats_dir,
