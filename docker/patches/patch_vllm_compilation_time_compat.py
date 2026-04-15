@@ -9,11 +9,20 @@ from pathlib import Path
 def _patch_text(text: str) -> str:
     # Keep this patch expression-only to avoid indentation/syntax regressions
     # across upstream formatting variants.
-    old = "t.language_model for t in compilation_times"
-    new = "getattr(t, \"language_model\", t) for t in compilation_times"
-    if old not in text:
-        return text
-    return text.replace(old, new, 1)
+    replacements = (
+        (
+            "t.language_model for t in compilation_times",
+            "getattr(t, \"language_model\", t) for t in compilation_times",
+        ),
+        (
+            "t.encoder for t in compilation_times",
+            "getattr(t, \"encoder\", 0.0) for t in compilation_times",
+        ),
+    )
+    out = text
+    for old, new in replacements:
+        out = out.replace(old, new)
+    return out
 
 
 def main() -> None:

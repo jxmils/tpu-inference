@@ -13,8 +13,9 @@
 # limitations under the License.
 
 ARG BASE_IMAGE="python:3.12-slim-bookworm"
-# The latest main will be used if arg unspecified
-ARG VLLM_COMMIT_HASH=""
+# Pin vLLM by default for deterministic/reproducible builds.
+# Override with --build-arg VLLM_COMMIT_HASH=<sha> when needed.
+ARG VLLM_COMMIT_HASH="60995c05b"
 
 FROM $BASE_IMAGE
 
