@@ -44,13 +44,16 @@ ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_COMMIT_HASH
 
 COPY docker/patches/patch_vllm_attention_output_block_scale.py /tmp/patch_vllm_attention_output_block_scale.py
+COPY docker/patches/patch_vllm_compilation_time_compat.py /tmp/patch_vllm_compilation_time_compat.py
 
 RUN git clone $VLLM_REPO . && \
     if [ -n "$VLLM_COMMIT_HASH" ]; then \
         git checkout $VLLM_COMMIT_HASH; \
     fi
 RUN python /tmp/patch_vllm_attention_output_block_scale.py
+RUN python /tmp/patch_vllm_compilation_time_compat.py
 RUN python -m py_compile /workspace/vllm/vllm/model_executor/layers/attention/attention.py
+RUN python -m py_compile /workspace/vllm/vllm/v1/executor/abstract.py
 
 RUN --mount=type=cache,target=/root/.cache/pip pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements/tpu.txt --retries 3
 RUN --mount=type=cache,target=/root/.cache/pip VLLM_TARGET_DEVICE="tpu" pip install -e .
