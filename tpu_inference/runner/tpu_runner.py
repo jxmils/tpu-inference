@@ -558,6 +558,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if envs.NEW_MODEL_DESIGN:
             return True
 
+        sc: ShardingConfigManager = self.vllm_config.sharding_config
+        # Legacy 2D mesh is only (data, model). It cannot represent expert
+        # parallelism or attention-DP axes; using it with EP>1 reshapes 8 devices
+        # into (1, TP) and crashes (e.g. Qwen vLLM + --enable-expert-parallel).
+        if (sc.expert_size > 1 or sc.attn_dp_expert_size > 1
+                or sc.attn_dp_size > 1):
+            return True
+
         architectures = getattr(self.vllm_config.model_config.hf_config,
                                 "architectures", [])
         # DeepSeek's flax_nnx path expects the full mesh axis set, including
