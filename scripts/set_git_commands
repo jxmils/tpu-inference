@@ -1,0 +1,283 @@
+gcloud compute tpus tpu-vm create "node-2" \
+  --zone "us-east1-d" \
+  --project "friendly-aurora-492610-i8" \
+  --accelerator-type "v6e-8" \
+  --version "v2-alpha-tpuv6e" \
+  --spot
+
+gcloud compute tpus tpu-vm delete node-2 \
+  --zone us-east1-d \
+  --project friendly-aurora-492610-i8 \
+  --quiet
+
+gcloud compute tpus tpu-vm ssh --zone "us-east1-d" "node-2" --project "friendly-aurora-492610-i8"
+
+
+gcloud compute tpus tpu-vm create "node-2" \
+  --zone "europe-west4-a" \
+  --project "friendly-aurora-492610-i8" \
+  --accelerator-type "v6e-8" \
+  --version "v2-alpha-tpuv6e" \
+  --spot
+
+gcloud compute tpus tpu-vm delete node-2 \
+  --zone europe-west4-a \
+  --project friendly-aurora-492610-i8 \
+  --quiet
+
+gcloud compute tpus tpu-vm ssh --zone "europe-west4-a" "node-2" --project "friendly-aurora-492610-i8"
+
+cd ~
+git clone https://github.com/jxmils/tpu-inference.git
+cd tpu-inference
+git rev-parse HEAD
+git status
+
+
+sudo docker build --no-cache -f docker/Dockerfile -t jxmils/tpu-inference:moe-trace .
+
+
+
+sudo docker run -it --rm --name $USER-vllm --privileged --net=host \
+  -v /dev/shm:/dev/shm \
+  --shm-size 300gb \
+  -e CAPTURE_MOE_ROUTING_STATS=1 \
+  -e CAPTURE_MOE_ROUTER_PROBS=1 \
+  -e MOE_ROUTING_STATS_DIR=/home/jasonmiller \
+  -e REQUEST_STATS_DIR=/home/jasonmiller \
+  -e TRACE_STEP_STRIDE=20 \
+  --entrypoint /bin/bash \
+  jxmils/tpu-inference:moe-trace
+
+
+
+# supported models https://docs.vllm.ai/projects/tpu/en/latest/recommended_models_features/#models
+
+export HF_HOME=/dev/shm
+# Set HF_TOKEN in your environment before sourcing (do not commit tokens).
+export HF_TOKEN="${HF_TOKEN:-}"
+export MAX_MODEL_LEN=4096
+export TP=8
+export VLLM_TORCH_PROFILER_DIR=/workspace/vllm_jax_profiles
+mkdir -p "$VLLM_TORCH_PROFILER_DIR"
+
+vllm serve Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --seed 42 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 256 \
+  --tensor-parallel-size $TP \
+  --enable-chunked-prefill \
+  --max-model-len $MAX_MODEL_LEN \
+  --profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${VLLM_TORCH_PROFILER_DIR}\"}"
+
+
+
+
+
+export TP=2
+export EP=4
+export USE_UNFUSED_MEGABLOCKS=1
+export CAPTURE_MOE_EP_RAGGED_A2A=1
+export HF_HOME=/dev/shm
+# Set HF_TOKEN in your environment before sourcing (do not commit tokens).
+export HF_TOKEN="${HF_TOKEN:-}"
+export MAX_MODEL_LEN=4096
+export VLLM_TORCH_PROFILER_DIR=/workspace/vllm_jax_profiles
+mkdir -p "$VLLM_TORCH_PROFILER_DIR"
+vllm serve deepseek-ai/DeepSeek-V3.1 \
+  --seed 42 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 256 \
+  --tensor-parallel-size $TP \
+  --enable-chunked-prefill \
+  --max-model-len $MAX_MODEL_LEN \
+  --additional-config "{\"sharding\":{\"sharding_strategy\":{\"tensor_parallelism\":$TP,\"expert_parallelism\":$EP}}}" \
+  --profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${VLLM_TORCH_PROFILER_DIR}\"}"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+export HF_HOME=/dev/shm
+# Set HF_TOKEN in your environment before sourcing (do not commit tokens).
+export HF_TOKEN="${HF_TOKEN:-}"
+export MAX_MODEL_LEN=4096
+export TP=8
+export VLLM_TORCH_PROFILER_DIR=/workspace/vllm_jax_profiles
+mkdir -p "$VLLM_TORCH_PROFILER_DIR"
+vllm serve meta-llama/Llama-3.3-70B-Instruct \
+  --seed 42 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 256 \
+  --tensor-parallel-size $TP \
+  --enable-chunked-prefill \
+  --max-model-len $MAX_MODEL_LEN \
+  --profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${VLLM_TORCH_PROFILER_DIR}\"}"
+
+
+
+from a secoond shell
+
+sudo docker exec -it $USER-vllm /bin/bash
+
+curl http://localhost:8000/v1/completions \
+-H "Content-Type: application/json" \
+-d '{
+    "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "prompt": "The future of AI is",
+    "max_tokens": 200,
+    "temperature": 0
+    }'
+
+
+pip install datasets
+vllm bench serve \
+    --backend vllm \
+    --model "Qwen/Qwen3-30B-A3B-Instruct-2507"  \
+    --dataset-name random \
+    --num-prompts 500 \
+    --request-rate 4.0 \
+    --burstiness 1.0 \
+    --seed 100
+
+
+
+
+sudo docker exec -it $USER-vllm /bin/bash
+
+
+pip install -U datasets
+python3 - <<'PY'
+from datasets import load_dataset
+import json
+ds = load_dataset("Aeala/ShareGPT_Vicuna_unfiltered", split="train")
+rows = [ds[i] for i in range(min(100_000, len(ds)))]
+with open("sharegpt_sample.json", "w", encoding="utf-8") as f:
+    json.dump(rows, f)
+PY
+
+vllm bench serve \
+    --backend vllm \
+    --model "Qwen/Qwen3-30B-A3B-Instruct-2507" \
+    --dataset-name sharegpt \
+    --dataset-path sharegpt_sample.json \
+    --num-prompts 1000 \
+    --request-rate 10.0 \
+    --burstiness 1.0 \
+    --seed 100 \
+    --port 8000
+
+
+
+
+
+# Get mmlu 
+pip install -U datasets
+
+python - <<'PY'
+import json
+from datasets import load_dataset
+
+subjects = [
+    "abstract_algebra",
+    "anatomy",
+    "college_computer_science",   # or "high_school_computer_science"
+]
+
+letters = ["A", "B", "C", "D"]
+split = "test"
+per_subject = 100
+
+for subject in subjects:
+    ds = load_dataset("cais/mmlu", subject, split=split)
+    out_path = f"mmlu_{subject}.jsonl"
+
+    with open(out_path, "w") as f:
+        take = min(per_subject, len(ds))
+        for ex in ds.select(range(take)):
+            choices = ex["choices"]
+            answer_idx = int(ex["answer"])
+
+            prompt = (
+                "Answer the following multiple choice question.\n\n"
+                f"Subject: {subject}\n"
+                f"Question: {ex['question']}\n"
+                f"A. {choices[0]}\n"
+                f"B. {choices[1]}\n"
+                f"C. {choices[2]}\n"
+                f"D. {choices[3]}\n\n"
+                "Reply with only the correct letter: A, B, C, or D."
+            )
+
+            row = {
+                "prompt": prompt,
+                "output_tokens": 8,
+                "metadata": {
+                    "subject": subject,
+                    "gold_letter": letters[answer_idx],
+                    "gold_index": answer_idx,
+                },
+            }
+            f.write(json.dumps(row) + "\n")
+
+    print("wrote", out_path)
+PY
+
+vllm bench serve \
+  --backend vllm \
+  --model "Qwen/Qwen3-30B-A3B-Instruct-2507" \
+  --dataset-name custom \
+  --dataset-path mmlu_abstract_algebra.jsonl \
+  --num-prompts 100 \
+  --seed 100
+
+# get ip 
+hostname -I | awk "{print \$1}"
+
+
+sudo docker cp jasonmiller-vllm:/home/jasonmiller/hbm /home/jasonmiller/
+sudo docker cp jasonmiller-vllm:/home/jasonmiller/raw /home/jasonmiller/
+sudo docker cp jasonmiller-vllm:/home/jasonmiller/step /home/jasonmiller/
+sudo docker cp jasonmiller-vllm:/home/jasonmiller/summary /home/jasonmiller/
+
+
+tar -czf traces.tar.gz hbm raw step summary
+ls -lh traces.tar.gz
+
+or 
+
+
+
+
+
+
+
+
+sudo docker exec jasonmiller-vllm tar -czf /home/jasonmiller/traces.tar.gz -C /home/jasonmiller hbm raw step summary
+sudo docker cp jasonmiller-vllm:/home/jasonmiller/traces.tar.gz /home/jasonmiller/
+
+# local
+mkdir -p ~/Downloads/tpu-traces
+gcloud compute tpus tpu-vm scp \
+  --zone "europe-west4-a" \
+  --project "friendly-aurora-492610-i8" \
+  "node-2:/home/jasonmiller/traces.tar.gz" \
+  ~/Downloads/tpu-traces/
+
+
+
+
+
+

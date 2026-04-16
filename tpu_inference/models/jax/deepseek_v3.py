@@ -29,7 +29,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Float
 from vllm.config import VllmConfig
 
-from tpu_inference import utils
+from tpu_inference import envs, utils
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.kernels.quantized_matmul.util import quantize_tensor
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
@@ -72,6 +72,53 @@ def _weight_init(random_init: bool):
 
 
 modeling_flax_utils = FlaxUtils()
+
+
+def _aggregate_routing_stats(
+        per_layer_stats: List[dict | None]) -> dict:
+    present = [stats for stats in per_layer_stats if stats is not None]
+    if not present:
+        return {}
+    total_expert_counts = sum(stats["expert_counts"] for stats in present)
+    total_unique_token_counts = sum(
+        stats["unique_token_counts"] for stats in present)
+    total_dispatch_bytes = sum(stats["estimated_dispatch_bytes"]
+                               for stats in present)
+    total_return_bytes = sum(stats["estimated_return_bytes"]
+                             for stats in present)
+    total_a2a_bytes = None
+    total_a2a_counts = None
+    if any("a2a_bytes" in stats for stats in present):
+        total_a2a_bytes = sum(stats.get("a2a_bytes", 0) for stats in present)
+        total_a2a_counts = sum(stats.get("a2a_counts", 0) for stats in present)
+    ep_ragged_dispatch_bytes = None
+    ep_ragged_return_bytes = None
+    if any("ep_ragged_a2a_dispatch_bytes" in stats for stats in present):
+        ep_ragged_dispatch_bytes = sum(
+            stats["ep_ragged_a2a_dispatch_bytes"]
+            for stats in present
+            if "ep_ragged_a2a_dispatch_bytes" in stats)
+        ep_ragged_return_bytes = sum(
+            stats["ep_ragged_a2a_return_bytes"]
+            for stats in present
+            if "ep_ragged_a2a_return_bytes" in stats)
+    return {
+        "num_layers": jnp.asarray(len(present), dtype=jnp.int32),
+        "num_experts": present[0]["num_experts"],
+        "k": present[0]["k"],
+        "expert_counts": total_expert_counts,
+        "unique_token_counts": total_unique_token_counts,
+        "estimated_dispatch_bytes": total_dispatch_bytes,
+        "estimated_return_bytes": total_return_bytes,
+        "estimated_dispatch_bytes_total": jnp.sum(total_dispatch_bytes),
+        "estimated_return_bytes_total": jnp.sum(total_return_bytes),
+        "a2a_bytes_total": total_a2a_bytes,
+        "a2a_counts_total": total_a2a_counts,
+        "a2a_bytes_total_sum": (jnp.sum(total_a2a_bytes)
+                                if total_a2a_bytes is not None else None),
+        "ep_ragged_a2a_dispatch_bytes_total": ep_ragged_dispatch_bytes,
+        "ep_ragged_a2a_return_bytes_total": ep_ragged_return_bytes,
+    }
 
 # TODO: read these configs from HF config.
 num_local_experts: int = 256
@@ -816,15 +863,26 @@ class SharedFusedMoe(JaxMoE):
 
     routed_scaling_factor: float = 1.0
 
-    def __call__(self, x_TD: jax.Array) -> jax.Array:
+    def __call__(self,
+                 x_TD: jax.Array,
+                 *,
+                 layer_idx: int | None = None) -> jax.Array | tuple[jax.Array,
+                                                                   dict]:
         # Compute Routed Experts
-        final_hidden_states = super().__call__(x_TD)
+        capture_routing_stats = envs.moe_routing_stats_enabled()
+        if capture_routing_stats:
+            final_hidden_states, routing_stats = super().__call__(
+                x_TD, capture_routing_stats=True, layer_idx=layer_idx)
+        else:
+            final_hidden_states = super().__call__(x_TD)
 
         # (Maybe) Compute Shared Experts
         if self.shared_experts is not None:
             shared_output = self.shared_experts(x_TD)
             final_hidden_states += shared_output
 
+        if capture_routing_stats:
+            return final_hidden_states, routing_stats
         return final_hidden_states
 
 
@@ -916,8 +974,11 @@ class DeepseekV2Moe(JaxModule):
             shared_experts=self.shared_experts,
             routed_scaling_factor=routed_scaling_factor)
 
-    def __call__(self, x_TD: jax.Array):
-        return self.experts(x_TD)
+    def __call__(self,
+                 x_TD: jax.Array,
+                 *,
+                 layer_idx: int | None = None):
+        return self.experts(x_TD, layer_idx=layer_idx)
 
 
 class DeepseekV3DecoderLayer(JaxModule):
@@ -942,7 +1003,8 @@ class DeepseekV3DecoderLayer(JaxModule):
     def __call__(
         self, x_TD: jax.Array, *, kv_cache: List[jax.Array],
         attention_metadata: AttentionMetadata
-    ) -> Tuple[List[jax.Array], jax.Array]:
+    ) -> Tuple[List[jax.Array], jax.Array] | Tuple[List[jax.Array], jax.Array,
+                                                   dict]:
 
         # Run Self-Attention
         residual = x_TD
@@ -954,11 +1016,18 @@ class DeepseekV3DecoderLayer(JaxModule):
         # Run MLP/MoE
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        mlp_output = self.mlp(hidden_states)
+        capture_routing_stats = envs.moe_routing_stats_enabled()
+        if capture_routing_stats and isinstance(self.mlp, DeepseekV2Moe):
+            mlp_output, routing_stats = self.mlp(hidden_states)
+        else:
+            mlp_output = self.mlp(hidden_states)
+            routing_stats = None
 
         # Residual
         hidden_states = residual + mlp_output
 
+        if capture_routing_stats:
+            return new_cache, hidden_states, routing_stats
         return new_cache, hidden_states
 
 
@@ -1313,22 +1382,38 @@ class DeepSeekV3(JaxModule):
         input_ids: Optional[jax.Array],
         attention_metadata: AttentionMetadata,
         inputs_embeds: Optional[jax.Array] = None,
-    ) -> Tuple[List[jax.Array], jax.Array]:
+    ) -> Tuple[List[jax.Array], jax.Array] | Tuple[List[jax.Array], jax.Array,
+                                                   dict]:
         if inputs_embeds is not None:
             x = inputs_embeds
         else:
             x = self.embed_tokens(input_ids)
 
+        capture_routing_stats = envs.moe_routing_stats_enabled()
+        routing_stats = [] if capture_routing_stats else None
         for i, layer in enumerate(
                 islice(self.layers, self.start_layer, self.end_layer)):
             kv_cache = kv_caches[i]
-            kv_cache, x = layer(
-                x,
-                kv_cache=kv_cache,
-                attention_metadata=attention_metadata,
-            )
+            if capture_routing_stats:
+                kv_cache, x, layer_stats = layer(
+                    x,
+                    kv_cache=kv_cache,
+                    attention_metadata=attention_metadata,
+                )
+                routing_stats.append(layer_stats)
+            else:
+                kv_cache, x = layer(
+                    x,
+                    kv_cache=kv_cache,
+                    attention_metadata=attention_metadata,
+                )
             kv_caches[i] = kv_cache
         x = self.norm(x)
+        if capture_routing_stats:
+            return kv_caches, x, {
+                "per_layer": routing_stats,
+                "aggregate": _aggregate_routing_stats(routing_stats),
+            }
         return kv_caches, x
 
 
@@ -1397,17 +1482,26 @@ class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
         if not is_first_rank:
             assert intermediate_tensors is not None
             inputs_embeds = intermediate_tensors["hidden_states"]
-
-        kv_caches, x = self.model(
-            kv_caches,
-            input_ids,
-            attention_metadata,
-            inputs_embeds,
-        )
+        capture_routing_stats = envs.moe_routing_stats_enabled()
+        if capture_routing_stats:
+            kv_caches, x, routing_stats = self.model(
+                kv_caches,
+                input_ids,
+                attention_metadata,
+                inputs_embeds,
+            )
+        else:
+            kv_caches, x = self.model(
+                kv_caches,
+                input_ids,
+                attention_metadata,
+                inputs_embeds,
+            )
 
         if not is_last_rank:
             x = JaxIntermediateTensors(tensors={"hidden_states": x}, )
-
+        if capture_routing_stats:
+            return kv_caches, x, ([], routing_stats)
         return kv_caches, x, []
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:

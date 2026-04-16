@@ -16,6 +16,7 @@ import copy
 import functools
 import logging
 import random
+import re
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -301,6 +302,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def _init_routing_trace(self) -> None:
         self._routing_trace_writer: RoutingTraceWriter | None = None
         self._routing_trace_batch_meta: RoutingTraceBatchMeta | None = None
+        self._expert_capacity_writer: RequestTraceWriter | None = None
         self._routing_trace_step: int = 0
         capture_routing_stats = envs.moe_routing_stats_enabled()
         routing_stats_dir = envs.moe_routing_stats_dir()
@@ -309,6 +311,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 routing_stats_dir,
                 save_raw=envs.MOE_ROUTING_STATS_SAVE_RAW,
                 save_summary=envs.MOE_ROUTING_STATS_SAVE_SUMMARY,
+            )
+            self._expert_capacity_writer = RequestTraceWriter(
+                routing_stats_dir,
+                subdir="summary",
+                filename_prefix="expert_capacity",
+                rank=self.rank,
             )
 
     def _init_hbm_trace(self) -> None:
@@ -536,7 +544,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.rng_key = jax.random.key(self.model_config.seed)
 
     def _init_mesh(self) -> None:
-        if envs.NEW_MODEL_DESIGN:
+        if self._should_use_new_model_mesh():
             self.mesh = self._create_new_model_mesh()
         else:
             # NOTE(wenxindongwork): The new MoE kernel expects a 2D mesh, so we need
@@ -545,6 +553,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.mesh = self._create_2d_mesh()
 
         logger.info(f"Init mesh | mesh={self.mesh}")
+
+    def _should_use_new_model_mesh(self) -> bool:
+        if envs.NEW_MODEL_DESIGN:
+            return True
+
+        architectures = getattr(self.vllm_config.model_config.hf_config,
+                                "architectures", [])
+        # DeepSeek's flax_nnx path expects the full mesh axis set, including
+        # `attn_dp_expert`, even when those dimensions are effectively size 1.
+        return "DeepseekV3ForCausalLM" in architectures
 
     def _create_new_model_mesh(self) -> jax.sharding.Mesh:
         num_slices = envs.NUM_SLICES
@@ -807,7 +825,120 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         logger.info(f"Init model | "
                     f"hbm={common_utils.hbm_usage_gb(self.devices)}GiB")
+        self._persist_expert_capacity_snapshot()
         self._persist_hbm_snapshot("model_loaded")
+
+    @staticmethod
+    def _array_local_nbytes(arr: Any) -> int:
+        if not isinstance(arr, jax.Array):
+            return 0
+        shards = getattr(arr, "addressable_shards", None)
+        if shards is None:
+            return int(getattr(arr, "nbytes", 0) or 0)
+        total = 0
+        for shard in shards:
+            data = getattr(shard, "data", None)
+            if data is not None and hasattr(data, "nbytes"):
+                total += int(data.nbytes)
+        return total
+
+    def _persist_expert_capacity_snapshot(self) -> None:
+        if self._expert_capacity_writer is None or self.model is None:
+            return
+
+        layer_pat = re.compile(r"\.layers\.(\d+)\.")
+        expert_weight_keys = (
+            "kernel_gating",
+            "kernel_up_proj",
+            "kernel_down_proj",
+            "kernel_gating_upproj",
+        )
+
+        per_layer: dict[int, dict[str, Any]] = {}
+        for name, param in self.model.named_parameters():
+            if not any(k in name for k in expert_weight_keys):
+                continue
+            value = getattr(param, "value", None)
+            if not isinstance(value, jax.Array) or value.ndim < 2:
+                continue
+            e = int(value.shape[0])
+            if e <= 1:
+                continue
+            m = layer_pat.search(name)
+            if not m:
+                continue
+            layer_idx = int(m.group(1))
+            layer = per_layer.setdefault(
+                layer_idx,
+                {
+                    "num_experts": e,
+                    "expert_weight_bytes_global_total": 0.0,
+                    "expert_weight_bytes_local_total": 0.0,
+                    "tensor_count": 0,
+                },
+            )
+            if int(layer["num_experts"]) != e:
+                continue
+            global_bytes = float(getattr(value, "nbytes", 0) or 0)
+            local_bytes = float(self._array_local_nbytes(value))
+            layer["expert_weight_bytes_global_total"] += global_bytes
+            layer["expert_weight_bytes_local_total"] += local_bytes
+            layer["tensor_count"] += 1
+
+        if not per_layer:
+            return
+
+        layer_records: list[dict[str, Any]] = []
+        representative: dict[str, Any] | None = None
+        for layer_idx in sorted(per_layer.keys()):
+            info = per_layer[layer_idx]
+            e = int(info["num_experts"])
+            per_expert_global = float(info["expert_weight_bytes_global_total"]) / e
+            per_expert_local = float(info["expert_weight_bytes_local_total"]) / e
+            rec = {
+                "layer_idx": layer_idx,
+                "num_experts": e,
+                "per_expert_weight_bytes_global": per_expert_global,
+                "per_expert_weight_bytes_local": per_expert_local,
+                "expert_weight_bytes_global_total":
+                float(info["expert_weight_bytes_global_total"]),
+                "expert_weight_bytes_local_total":
+                float(info["expert_weight_bytes_local_total"]),
+                "tensor_count": int(info["tensor_count"]),
+            }
+            layer_records.append(rec)
+            if representative is None:
+                representative = rec
+
+        assert representative is not None
+        e = int(representative["num_experts"])
+        per_expert_bytes = float(representative["per_expert_weight_bytes_local"])
+        self._expert_capacity_writer.write({
+            "record_type":
+            "expert_capacity_summary",
+            "trace_step":
+            int(self._routing_trace_step),
+            "model":
+            self.model_config.model,
+            "architectures":
+            getattr(self.model_config.hf_config, "architectures", []),
+            "tp_size":
+            int(self.vllm_config.sharding_config.tp_size),
+            "ep_size":
+            int(self.vllm_config.sharding_config.expert_size),
+            "num_layers_with_experts":
+            len(layer_records),
+            "layers":
+            layer_records,
+            "representative_layer_idx":
+            int(representative["layer_idx"]),
+            "num_experts":
+            e,
+            "per_expert_weight_bytes":
+            per_expert_bytes,
+            "per_expert_weight_bytes_list":
+            [per_expert_bytes] * e,
+        })
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         runner_type = self.model_config.runner_type
