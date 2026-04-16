@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 import numpy as np
+import torch
 import vllm.envs as vllm_envs
 from flax import nnx
 from jax._src.pallas.utils import next_power_of_2
@@ -850,6 +851,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 total += int(data.nbytes)
         return total
 
+    def _iter_named_parameters_for_capacity(self):
+        """Yield ``(name, param)`` for expert-capacity sizing.
+
+        Flax nnx merged modules expose ``named_parameters`` on the module.
+        :class:`~tpu_inference.models.vllm.vllm_model_wrapper.VllmModelWrapper`
+        wraps weights in an inner ``torch.nn.Module`` (``wrapper.model``).
+        """
+        if self.model is None:
+            return
+        m = self.model
+        if hasattr(m, "named_parameters"):
+            yield from m.named_parameters()
+            return
+        inner = getattr(m, "model", None)
+        if inner is not None and hasattr(inner, "named_parameters"):
+            yield from inner.named_parameters()
+
     def _persist_expert_capacity_snapshot(self) -> None:
         if self._expert_capacity_writer is None or self.model is None:
             return
@@ -863,13 +881,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         )
 
         per_layer: dict[int, dict[str, Any]] = {}
-        for name, param in self.model.named_parameters():
-            if not any(k in name for k in expert_weight_keys):
+        for name, param in self._iter_named_parameters_for_capacity():
+            is_flax_key = any(k in name for k in expert_weight_keys)
+            # vLLM MoE modules use PyTorch parameter names under `.experts.`
+            if not is_flax_key and ".experts." not in name:
                 continue
             value = getattr(param, "value", None)
-            if not isinstance(value, jax.Array) or value.ndim < 2:
-                continue
-            e = int(value.shape[0])
+            if isinstance(value, jax.Array):
+                if value.ndim < 2:
+                    continue
+                e = int(value.shape[0])
+                global_bytes = float(getattr(value, "nbytes", 0) or 0)
+                local_bytes = float(self._array_local_nbytes(value))
+            else:
+                tensor = param if isinstance(param, torch.Tensor) else getattr(
+                    param, "data", None)
+                if not isinstance(tensor, torch.Tensor) or tensor.ndim < 2:
+                    continue
+                e = int(tensor.shape[0])
+                el_sz = int(tensor.element_size())
+                global_bytes = float(int(tensor.numel()) * el_sz)
+                # Single-host executor: treat dense tensor size as local for EP sizing.
+                local_bytes = global_bytes
             if e <= 1:
                 continue
             m = layer_pat.search(name)
@@ -887,8 +920,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             )
             if int(layer["num_experts"]) != e:
                 continue
-            global_bytes = float(getattr(value, "nbytes", 0) or 0)
-            local_bytes = float(self._array_local_nbytes(value))
             layer["expert_weight_bytes_global_total"] += global_bytes
             layer["expert_weight_bytes_local_total"] += local_bytes
             layer["tensor_count"] += 1
