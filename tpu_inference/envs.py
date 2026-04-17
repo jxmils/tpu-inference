@@ -19,6 +19,12 @@ if TYPE_CHECKING:
     MODEL_IMPL_TYPE: str = "auto"
     NEW_MODEL_DESIGN: bool = False
     PHASED_PROFILING_DIR: str = ""
+    XLA_DUMP_TO: str = ""
+    # Pass-through for vLLM/libtpu: enable only if your image documents it.
+    VLLM_TPU_LLO_PROFILING: str = ""
+    CAPTURE_ICI_TPUMONITORING: bool = False
+    ICI_TPUMONITORING_METRICS: str = ""
+    JAX_PROFILER_CREATE_PERFETTO_TRACE: bool = False
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
     USE_UNFUSED_MEGABLOCKS: bool = False
@@ -228,6 +234,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Directory to store phased profiling output
     "PHASED_PROFILING_DIR":
     lambda: os.getenv("PHASED_PROFILING_DIR", ""),
+    # If set, merged into XLA_FLAGS as --xla_dump_to=... before JAX compiles
+    # (see tpu_inference.xla_env; also tpu_inference.worker.tpu_worker).
+    "XLA_DUMP_TO":
+    lambda: os.getenv("XLA_DUMP_TO", ""),
+    # Optional: extra low-level TPU profiling when supported by your vLLM/libtpu
+    # build (see docs/profiling.md — ICI / XProf section).
+    "VLLM_TPU_LLO_PROFILING":
+    lambda: os.getenv("VLLM_TPU_LLO_PROFILING", ""),
+    # libtpu.sdk.tpumonitoring snapshots around model_fn (see docs/profiling.md).
+    "CAPTURE_ICI_TPUMONITORING":
+    env_bool("CAPTURE_ICI_TPUMONITORING", default=False),
+    # Comma-separated metric names for tpumonitoring.get_metric (TPU / version specific).
+    "ICI_TPUMONITORING_METRICS":
+    lambda: os.getenv("ICI_TPUMONITORING_METRICS",
+                      "ici_flits_tx,ici_flits_rx"),
+    # If 1, jax.profiler.start_trace also writes perfetto_trace.json.gz (TPUWorker).
+    "JAX_PROFILER_CREATE_PERFETTO_TRACE":
+    env_bool("JAX_PROFILER_CREATE_PERFETTO_TRACE", default=False),
     # Python tracer level for profiling
     "PYTHON_TRACER_LEVEL":
     lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),

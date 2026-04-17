@@ -53,6 +53,9 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 import tpu_inference.envs as envs
 from tpu_inference import utils as common_utils
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.runner.ici_tpumonitoring import (ICITpuMonitoringCapture,
+                                                    metric_delta)
+from tpu_inference.runner.step_trace_proxies import comm_bytes_proxy_for_step
 from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
                                                   MESH_AXIS_NAMES_2D,
                                                   ShardingAxisName,
@@ -266,6 +269,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._init_routing_trace()
         self._init_hbm_trace()
         self._init_step_trace()
+        self._init_ici_tpumonitoring()
 
         # Delegate functions to specific manager classes.
         self.compilation_manager = CompilationManager(self)
@@ -297,6 +301,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Wall time for the last `model_fn` call (host); pair with step trace bytes
         # for effective-bandwidth proxies (e.g. a2a_bytes / s).
         self._last_model_forward_wall_time_s: float | None = None
+        # Wall time for the last `compute_logits_fn` call (host); LM head vs body.
+        self._last_compute_logits_wall_time_s: float | None = None
         self._trace_step_stride = int(envs.TRACE_STEP_STRIDE)
         self._persist_hbm_snapshot("runner_initialized")
 
@@ -336,6 +342,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 filename_prefix="step_trace",
                 rank=self.rank,
             )
+
+    def _init_ici_tpumonitoring(self) -> None:
+        """Optional libtpu.sdk.tpumonitoring snapshots around ``model_fn``."""
+        self._ici_hw_capture: ICITpuMonitoringCapture | None = None
+        self._ici_hw_before: Optional[Dict[str, List[float]]] = None
+        self._ici_hw_after: Optional[Dict[str, List[float]]] = None
+        if not envs.CAPTURE_ICI_TPUMONITORING:
+            return
+        raw = (envs.ICI_TPUMONITORING_METRICS or "").strip()
+        names = tuple(s.strip() for s in raw.split(",") if s.strip())
+        if not names:
+            names = ("ici_flits_tx", "ici_flits_rx")
+        self._ici_hw_capture = ICITpuMonitoringCapture.try_create(names)
 
     def _needs_trace_batch_meta(self) -> bool:
         return (self._routing_trace_writer is not None
@@ -423,6 +442,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if routing_stats is None or self._routing_trace_batch_meta is None:
             return
         if not self._should_persist_current_trace_step():
+            # Drop ICI snapshots for this step so we never merge a skipped step.
+            self._ici_hw_before = None
+            self._ici_hw_after = None
             return
         self._persist_step_trace(routing_stats, scheduler_output)
 
@@ -504,6 +526,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if a2a_total is None:
             a2a_total = _to_sum(aggregate.get("a2a_bytes_total"))
 
+        comm_proxy, comm_proxy_src = comm_bytes_proxy_for_step(
+            dispatch_total, return_total, a2a_total)
+
         phase_per_req = _get_phase_per_req(
             self._routing_trace_batch_meta.num_computed_tokens,
             self._routing_trace_batch_meta.num_prompt_tokens)
@@ -531,10 +556,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return_total,
             "a2a_bytes_total_sum":
             a2a_total,
+            "comm_bytes_proxy_total":
+            comm_proxy,
+            "comm_bytes_proxy_source":
+            comm_proxy_src,
             "model_forward_wall_time_s":
             self._last_model_forward_wall_time_s,
+            "compute_logits_wall_time_s":
+            self._last_compute_logits_wall_time_s,
         }
         rec.update(self._extract_kv_connector_stats(scheduler_output))
+        if (self._ici_hw_capture is not None and self._ici_hw_before is not None
+                and self._ici_hw_after is not None):
+            try:
+                rec.update(metric_delta(self._ici_hw_before, self._ici_hw_after))
+            finally:
+                self._ici_hw_before = None
+                self._ici_hw_after = None
         self._step_trace_writer.write(rec)
 
     def _init_random(self):
@@ -1184,6 +1222,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices_selector,
             padded_num_reqs,
         ) = self._prepare_inputs(scheduler_output)
+        self._last_compute_logits_wall_time_s = None
         step_trace_extra = {
             "num_active_reqs": int(self.input_batch.num_reqs),
             "num_finished_reqs": int(len(scheduler_output.finished_req_ids)),
@@ -1197,7 +1236,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if self.is_multimodal_model:
             # Run the multimodal encoder if any.
             # We have the modality embeds at this time.
-            self.mm_manager.execute_mm_encoder(scheduler_output)
+            with jax.profiler.TraceAnnotation("vllm:mm_encoder"):
+                self.mm_manager.execute_mm_encoder(scheduler_output)
             mm_embeds = self.mm_manager.gather_mm_embeddings(
                 scheduler_output, input_ids.shape[0])
         else:
@@ -1224,23 +1264,34 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output) as kv_connector_output:
                 # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
                 # but one of them would be `None`
-                _t_model_fn = time.perf_counter()
-                (self.kv_caches, hidden_states,
-                 aux_hidden_states) = self.model_fn(
-                     self.state,
-                     self.kv_caches,
-                     input_ids,
-                     attn_metadata,
-                     inputs_embeds,
-                     input_positions,
-                     tuple(self.layer_name_to_kvcache_index.items()),
-                     lora_metadata,
-                     intermediate_tensors,
-                     self.is_first_rank,
-                     self.is_last_rank,
-                 )
-                self._last_model_forward_wall_time_s = (
-                    time.perf_counter() - _t_model_fn)
+                if self._ici_hw_capture is not None:
+                    self._ici_hw_before = self._ici_hw_capture.snapshot()
+                else:
+                    self._ici_hw_before = None
+                with jax.profiler.TraceAnnotation("vllm:model_fn"):
+                    _t_model_fn = time.perf_counter()
+                    (self.kv_caches, hidden_states,
+                     aux_hidden_states) = self.model_fn(
+                         self.state,
+                         self.kv_caches,
+                         input_ids,
+                         attn_metadata,
+                         inputs_embeds,
+                         input_positions,
+                         tuple(self.layer_name_to_kvcache_index.items()),
+                         lora_metadata,
+                         intermediate_tensors,
+                         self.is_first_rank,
+                         self.is_last_rank,
+                     )
+                    self._last_model_forward_wall_time_s = (
+                        time.perf_counter() - _t_model_fn)
+                if self._ici_hw_capture is not None:
+                    self._block_until_ready_for_hbm(
+                        (self.kv_caches, hidden_states))
+                    self._ici_hw_after = self._ici_hw_capture.snapshot()
+                else:
+                    self._ici_hw_after = None
             routing_stats = None
             if isinstance(aux_hidden_states, tuple) and len(
                     aux_hidden_states) == 2:
@@ -1282,11 +1333,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
             hidden_states = self._select_from_array_fn(hidden_states,
                                                        logits_indices)
-            logits = self.compute_logits_fn(
-                self.state,
-                hidden_states,
-                lora_metadata,
-            )
+            with jax.profiler.TraceAnnotation("vllm:compute_logits"):
+                _t_logits = time.perf_counter()
+                logits = self.compute_logits_fn(
+                    self.state,
+                    hidden_states,
+                    lora_metadata,
+                )
+                self._last_compute_logits_wall_time_s = (
+                    time.perf_counter() - _t_logits)
         self._persist_hbm_snapshot("after_execute_model",
                                    sync_obj=logits,
                                    extra=step_trace_extra)

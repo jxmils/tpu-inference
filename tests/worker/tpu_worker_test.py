@@ -346,6 +346,7 @@ class TestTPUWorker:
         mock_jax.profiler.start_trace.assert_called_once()
         args, kwargs = mock_jax.profiler.start_trace.call_args
         assert args[0] == "/tmp/profile_dir"
+        assert kwargs.get("create_perfetto_trace") is False
         # Verify options from env var were used
         assert kwargs['profiler_options'].python_tracer_level == 1
 
@@ -356,8 +357,21 @@ class TestTPUWorker:
                            local_rank=0,
                            rank=0,
                            distributed_init_method="test")
+        worker.profile_dir = "/tmp/profile_dir"
+        worker.profile(is_start=True)
         worker.profile(is_start=False)
         mock_jax.profiler.stop_trace.assert_called_once()
+
+    def test_profile_start_skipped_without_profile_dir(self, mock_vllm_config):
+        """start_trace is not called when no trace directory was configured."""
+        with patch('tpu_inference.worker.tpu_worker.jax') as mock_jax:
+            worker = TPUWorker(vllm_config=mock_vllm_config,
+                               local_rank=0,
+                               rank=0,
+                               distributed_init_method="test")
+            assert worker.profile_dir is None
+            worker.profile(is_start=True)
+            mock_jax.profiler.start_trace.assert_not_called()
 
     def test_check_health(self, mock_vllm_config):
         """Tests that check_health runs without error."""

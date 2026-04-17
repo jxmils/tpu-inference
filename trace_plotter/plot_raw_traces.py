@@ -1605,6 +1605,11 @@ def plot_step_series(df: pd.DataFrame, out_dir: Path, prefix: str = "step") -> l
                     "(dispatch+return)/2 proxy / model_forward_wall_time_s (GB/s)",
                     "eff_bw_proxy_dispatch_gbps",
                 ),
+                (
+                    "comm_bytes_proxy_total",
+                    "comm_bytes_proxy_total / model_forward_wall_time_s (GB/s)",
+                    "eff_bw_proxy_comm_unified_gbps",
+                ),
             ):
                 if byte_col not in s.columns:
                     continue

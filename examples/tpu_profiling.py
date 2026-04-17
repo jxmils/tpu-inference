@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Implements profiling for vLLM on TPU VMs using the JAX profiler.
+# With --profiler-config profiler=torch, the worker uses jax.profiler.start_trace
+# / stop_trace (not PyTorch autograd). Traces are XPlane-compatible and show
+# on-device work on the TPU ICI, including tensor-parallel all-reduce and MoE
+# expert-parallel all-to-all.
 # NOTE: you will need the tensorboard-plugin-profile python package to
 # visualize the results in TensorBoard.
 # Please see docs/profiler.md for more details.

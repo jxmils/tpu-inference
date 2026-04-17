@@ -1,6 +1,6 @@
 # Profiling
 
-There are currently three ways to profile your workload:
+There are several complementary ways to profile your workload (in-process JAX, step JSONL, host ICI counters when available):
 
 ## Using `examples/tpu_profiling.py`
 
@@ -57,6 +57,61 @@ python3 examples/tpu_profiling.py \
   --output-len 1 \
   --batch-size 256
 ```
+
+## XLA HLO dumps (buffer assignment, activations, KV)
+
+To inspect XLA memory plans and buffer sizes (including large activations and
+KV-related buffers), enable HLO dumps to a writable directory.
+
+**Option A — environment only (matches upstream XLA):**
+
+```bash
+export XLA_FLAGS="--xla_dump_to=/tmp/hlo_dumps"
+mkdir -p /tmp/hlo_dumps
+```
+
+**Option B — tpu-inference helper (merged before JAX compiles):**
+
+```bash
+export XLA_DUMP_TO=/tmp/hlo_dumps
+```
+
+When `tpu_inference` is imported normally, `env_override.py` merges
+`--xla_dump_to=<path>` into `XLA_FLAGS` if it is not already present. Set this in
+the same environment as `vllm serve` before the process starts. Dumps can be
+large and slow compilation; use a fast local disk and remove old trees between
+runs.
+
+## vLLM production metrics (Prometheus / Grafana / CSV)
+
+vLLM publishes engine statistics as Prometheus text on the OpenAI-compatible
+HTTP server at **`/metrics`** (no separate “StatsCollector” HTTP endpoint; the
+collector feeds these gauges). See
+[Production metrics](https://docs.vllm.ai/en/latest/usage/metrics.html).
+
+Relevant gauges for KV and load:
+
+| Gauge | Meaning |
+| --- | --- |
+| `vllm:kv_cache_usage_perc` | KV block utilization (0–1; 1 = full). |
+| `vllm:num_requests_running` | Requests in model execution batches. |
+| `vllm:num_requests_waiting` | Requests waiting to be scheduled. |
+
+**Grafana / Prometheus:** scrape `http://<api-host>:<port>/metrics` with your
+usual Prometheus job config.
+
+**Local CSV:** sample the endpoint into a spreadsheet-friendly file:
+
+```bash
+python3 scripts/vllm/prometheus_metrics_poll_csv.py \
+  --url http://127.0.0.1:8000/metrics \
+  --output /tmp/vllm_kv_stats.csv \
+  --interval-s 5
+```
+
+Stop with Ctrl+C. The table uses the public metric names above; there is no
+separate Prometheus series named `num_active_sequences` — use
+`vllm:num_requests_running` (and waiting) for concurrency.
 
 ## Using `PHASED_PROFILING_DIR`
 If you set the following environment variable:
@@ -124,6 +179,21 @@ In order to use this approach, you can do the following:
 
 6. Enter the desired amount of time (in ms)
 
+## Compute vs communication breakdown
+
+**Time (device-level):** Open the JAX/XPlane trace (TensorBoard **Profile** or **Perfetto**). The runner adds nested profiler scopes so you can align timelines:
+
+- `execute_model: …` — full scheduling step (existing).
+- `vllm:model_fn` — transformer `model_fn()` (attention, MoE, all collectives emitted inside that compiled region).
+- `vllm:compute_logits` — LM head / logits after hidden states.
+- `vllm:mm_encoder` — multimodal encoder path only.
+
+In XProf, collective ops (all-reduce, all-to-all, reduce-scatter, etc.) are **communication**; matmuls, activations, softmax, etc. are **compute**. **Overlap** appears when the critical path is shorter than the sum of isolated collective durations—use the trace critical path, not summed kernel labels alone.
+
+**Host wall splits (approximate):** `step/step_trace_*.jsonl` `step_summary` records include `model_forward_wall_time_s` and `compute_logits_wall_time_s` (body vs logits head only; they do **not** split MoE matmul vs MoE all-to-all).
+
+**Communication byte proxy:** `comm_bytes_proxy_total` and `comm_bytes_proxy_source` unify A2A vs dispatch/return estimates for GB/s numerators (see list under *MoE / interconnect* below). Pair with `model_forward_wall_time_s` only as a **rough** effective rate—the denominator still includes non-communication work.
+
 ## MoE / interconnect effective bandwidth from traces
 
 There is no single counter that reports “ICI GB/s” in Cloud Monitoring. You combine **payload estimates** with **time**:
@@ -134,13 +204,81 @@ When MoE routing capture is enabled, each `step_summary` line includes:
 
 - `estimated_dispatch_bytes_total`, `estimated_return_bytes_total` — token×expert routing byte models.
 - `a2a_bytes_total_sum` — populated only when **`CAPTURE_MOE_ROUTING_A2A=1`** (default on) **and** the model uses expert parallelism with a named data axis (`capture_a2a` path in `routing_stats.py`). Otherwise this field is `null`.
+- **`comm_bytes_proxy_total`**, **`comm_bytes_proxy_source`** — unified communication-byte estimate for the step (prefers A2A sum when positive, else dispatch+return, else a dispatch-only fallback; see section *Compute vs communication breakdown* above).
 - **`model_forward_wall_time_s`** — host-side wall time for the `model_fn()` call on that step (added for bandwidth proxies). This spans the full forward, not an isolated all-to-all kernel.
+- **`compute_logits_wall_time_s`** — host-side wall time for the logits head on that step (when the generative path runs `compute_logits_fn`).
 
 Set **`MOE_ROUTING_STATS_DIR`** and **`REQUEST_STATS_DIR`** to the same trace root (e.g. `.../raw_traces`) so routing summaries and step summaries land together.
 
 **Rough proxies** (interpret with care):
 
 - `(a2a_bytes_total_sum / model_forward_wall_time_s) / 1e9` → GB/s if A2A bytes are present.
+- `(comm_bytes_proxy_total / model_forward_wall_time_s) / 1e9` → unified comm-byte / time proxy when `comm_bytes_proxy_total` is non-null.
 - `((dispatch + return) / 2) / model_forward_wall_time_s` → another byte/time ratio when A2A is absent; denominator still includes attention, MLP, etc.
 
 For **kernel-level** collective time and sizes, use the JAX profiler (`examples/tpu_profiling.py`, `PHASED_PROFILING_DIR`, or `USE_JAX_PROFILER_SERVER`) and inspect the trace in TensorBoard / Perfetto.
+
+## TPU ICI hardware counters and host diagnostics (v6e / Trillium)
+
+JAX/XPlane (above) shows **what the program expressed** (collectives, fusion, timeline). On **TPU VMs**, Google’s host-side tooling can additionally expose **hardware performance counters** for the **Inter-Chip Interconnect (ICI)**—useful for a **traffic-matrix / hot-link** story during MoE all-to-all versus steady TP all-reduce.
+
+### In-process ICI snapshots (`libtpu.sdk.tpumonitoring`)
+
+**No sidecar:** set **`CAPTURE_ICI_TPUMONITORING=1`**. The runner snapshots selected counters **immediately before** and **immediately after** **`model_fn()`**, with **`jax.block_until_ready`** on **`(kv_caches, hidden_states)`** before the post-forward read so the delta aligns with completed device work. Deltas are written into the same **`step_summary`** JSONL record as **`comm_bytes_proxy_*`**, nested under **`ici_hw_delta`**: for each metric, **`delta_per_chip`** (list) and **`delta_sum`**.
+
+- **`ICI_TPUMONITORING_METRICS`**: comma-separated names (default `ici_flits_tx,ici_flits_rx`). Confirm names with **`tpumonitoring.list_supported_metrics()`** or [Cloud TPU monitoring docs](https://cloud.google.com/tpu/docs/tpu-monitoring-library) for your runtime.
+- **Prerequisites for the row:** **`CAPTURE_REQUEST_STATS`** + **`REQUEST_STATS_DIR`** (step trace writer), and the **MoE routing** path that calls **`_persist_step_trace`** — i.e. enable **`CAPTURE_MOE_ROUTING_STATS`** and **`MOE_ROUTING_STATS_DIR`** so **`step_summary`** lines are emitted for those steps.
+
+If **`libtpu.sdk.tpumonitoring`** is not importable, capture is skipped (no error).
+
+**Important:** package names, CLI flags, and **counter spellings change by image generation and diagnostics bundle version**. For host-only workflows, treat the **`tpu-info`** commands below as a **workflow**; always run `tpu-info --help` (or the tool your image ships) and **`--list_raw_counters`** (or equivalent) on **your** node before scripting a paper pipeline.
+
+### 1) Raw ICI counters (“flit” or link-level streams)
+
+On many TPU VM images, **`tpu-info`** is provided as part of Google’s accelerator diagnostics stack (naming varies, e.g. **cloud-accelerator-diagnostics**). Typical workflow:
+
+1. Discover what your build exports (examples only—**verify locally**):
+
+   ```bash
+   tpu-info --help
+   tpu-info --list_raw_counters    # if supported; flag name may differ
+   ```
+
+2. Stream a small set of **ICI-related** counters while you drive load (second shell or `tmux`), e.g. flit transmit/receive, stalls, or congestion—**pick exact metric names from the list**, not from a blog table:
+
+   ```bash
+   # From the tpu-inference repo root (inside the container if the repo is mounted):
+   ./scripts/tpu/ici_counters.sh list
+   # Illustrative metric names only—substitute names printed by the list command:
+   ./scripts/tpu/ici_counters.sh poll ici_flits_tx ici_flits_rx
+   ```
+
+   If `tpu-info` flags differ on your image, run `tpu-info --help` and adjust `scripts/tpu/ici_counters.sh` locally.
+
+3. **Correlate** counter CSV or logs with:
+
+   - wall-clock from your benchmark (`benchmark_serving.py` timestamps),
+   - engine **`step_summary`** lines (`trace_step`, `comm_bytes_proxy_*`, MoE routing),
+   - JAX **`jax.profiler.start_trace`** windows.
+
+That gives a **per-link or per-chip aggregate** view of whether certain ICI directions saturate during **EP-heavy** steps (skewed expert routing) versus flatter **TP AR-heavy** phases.
+
+### 2) XProf / low-level operation (LLO) bundles (optional)
+
+Some VM + **vLLM + libtpu** combinations support **extra low-level** profiling (sometimes referred to as **LLO** bundles or extended **XProf** capture). This is **not wired inside tpu-inference**; it depends on the **exact** `vllm`, `libtpu`, and Cloud Diagnostics packages on your **`moe-trace`** image.
+
+- Set **`VLLM_TPU_LLO_PROFILING=1`** in the environment **before** starting `vllm serve` **if** your stack documents that variable (confirm with `vllm serve --help` / release notes for your pin).
+- If your image installs **Cloud Diagnostics XProf** Python APIs, you may be able to trigger a **snapshot** to a directory alongside your existing `jax.profiler` output—again, follow the **version-specific** docs bundled with that package (module names and APIs move between releases).
+
+Use the same **output directory discipline** as JAX profiling (large files; fast disk).
+
+### 3) Relating XLA / HLO collectives to ICI behavior (TP vs EP)
+
+When you enable **`XLA_FLAGS=--xla_dump_to=...`** (or **`XLA_DUMP_TO`**, see earlier sections), HLO text and buffer assignment help you **name** the collective pattern per compiled region. At runtime, **XPlane** shows those collectives on the timeline. **ICI counters** (when available) show **fabric-level** stress. Together:
+
+| XLA / trace pattern | Typical role in vLLM TPU stacks | ICI intuition (paper framing) |
+| --- | --- | --- |
+| **All-reduce** (and related reductions across the **model** axis) | Tensor-parallel partial sums / norms | Steady, structured traffic; often similar **per layer** in dense or MoE blocks. |
+| **All-to-all** (and permutes / ragged variants) | Expert-parallel **dispatch / combine** | Volume and **skew** follow **router** choices; good fit for **hot-spot** counter analysis. |
+
+There is **no guaranteed 1:1** string mapping from a single HLO opcode name to a single hardware counter bucket on every build; use **HLO + XPlane + counters** as **triangulation**, not a single counter name in isolation.

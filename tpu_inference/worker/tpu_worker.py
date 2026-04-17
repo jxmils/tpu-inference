@@ -126,13 +126,20 @@ class TPUWorker(WorkerBase):
         self.profile_dir = None
         self.vllm_config.profiler_config
         profiler_config = self.vllm_config.profiler_config
+        # vLLM exposes this as profiler="torch" + torch_profiler_dir, but on TPU
+        # start_profile/stop_profile drive jax.profiler.start_trace/stop_trace,
+        # which writes XPlane-compatible traces (TensorBoard / XProf / Perfetto).
+        # Those traces include on-device collectives on the TPU ICI, including
+        # tensor-parallel all-reduce and MoE expert-parallel all-to-all.
         if profiler_config.profiler == "torch" and self.rank < 1 and self.pp_config.pp_world_size == 1:
             if not self.devices or 0 in self.device_ranks:
                 # For TPU, we can only have 1 active profiler session for 1 profiler
                 # server. So we only profile on rank0.
                 self.profile_dir = profiler_config.torch_profiler_dir
-                logger.info("Profiling enabled. Traces will be saved to: %s",
-                            self.profile_dir)
+                logger.info(
+                    "JAX profiler (jax.profiler.start_trace) enabled; "
+                    "device traces (XPlane) will be saved under: %s",
+                    self.profile_dir)
 
         # For PP, we use MPMD so we want to profile every worker.
         if self.pp_config.pp_world_size > 1 and profiler_config.profiler == "torch":
@@ -141,6 +148,9 @@ class TPUWorker(WorkerBase):
                 f"pprank_{self.rank}_ppworldsize_{self.pp_config.pp_world_size}"
             )
             os.makedirs(self.profile_dir, exist_ok=True)
+
+        # True only between a successful jax.profiler.start_trace and stop_trace.
+        self._jax_profiler_trace_active = False
 
         use_jax_profiler_server = os.getenv("USE_JAX_PROFILER_SERVER", False)
         # Only one instance of profiler is allowed
@@ -415,15 +425,40 @@ class TPUWorker(WorkerBase):
     def profile(self,
                 is_start: bool = True,
                 profile_prefix: str | None = None):
+        """Start or stop a JAX profiler trace (XPlane / TensorBoard plugin).
+
+        On TPU this is the supported way to see when all-reduce (TP) and
+        all-to-all (MoE EP) run on the ICI. Requires ``profiler_config.profiler ==
+        "torch"`` and ``torch_profiler_dir`` so ``self.profile_dir`` is set
+        (see ``examples/tpu_profiling.py``).
+        """
         if is_start:
+            if not self.profile_dir:
+                logger.warning(
+                    "profile(start) skipped: no JAX trace directory "
+                    "(set vLLM profiler to torch with torch_profiler_dir).")
+                return
+            if self._jax_profiler_trace_active:
+                logger.warning(
+                    "profile(start) skipped: JAX profiler trace already active.")
+                return
+            os.makedirs(self.profile_dir, exist_ok=True)
             options = jax.profiler.ProfileOptions()
             # default: https://docs.jax.dev/en/latest/profiling.html#general-options
             options.python_tracer_level = envs.PYTHON_TRACER_LEVEL
-            options.host_tracer_level = os.getenv("HOST_TRACER_LEVEL", 1)
-            jax.profiler.start_trace(self.profile_dir,
-                                     profiler_options=options)
+            options.host_tracer_level = int(os.getenv("HOST_TRACER_LEVEL", "1"))
+            perfetto = envs.JAX_PROFILER_CREATE_PERFETTO_TRACE
+            jax.profiler.start_trace(
+                self.profile_dir,
+                create_perfetto_trace=perfetto,
+                profiler_options=options,
+            )
+            self._jax_profiler_trace_active = True
         else:
+            if not self._jax_profiler_trace_active:
+                return
             jax.profiler.stop_trace()
+            self._jax_profiler_trace_active = False
 
     def load_model(self) -> None:
         self.model_runner.load_model()
