@@ -218,6 +218,29 @@ Set **`MOE_ROUTING_STATS_DIR`** and **`REQUEST_STATS_DIR`** to the same trace ro
 
 For **kernel-level** collective time and sizes, use the JAX profiler (`examples/tpu_profiling.py`, `PHASED_PROFILING_DIR`, or `USE_JAX_PROFILER_SERVER`) and inspect the trace in TensorBoard / Perfetto.
 
+### Automatic per-step comm vs compute table (Perfetto post-processing)
+
+If your trace directory contains `perfetto_trace.json` (or `.json.gz`), you can
+generate a per-step CSV with:
+
+- `comm_time_ms`
+- `compute_time_ms`
+- `overlap_ms`
+
+using:
+
+```bash
+python3 scripts/vllm/benchmarking/trace_comm_compute_breakdown.py \
+  --trace /workspace/vllm_jax_profiles/perfetto_trace.json.gz \
+  --output /workspace/vllm_jax_profiles/step_comm_compute.csv
+```
+
+This script uses the `execute_model: ...` trace scope as a step boundary and
+classifies communication events by name/category matches for collectives (for
+example `all-reduce`, `all-to-all`, `reduce-scatter`, `collective-permute`,
+`send`, `recv`). It is a practical approximation for paper plots; verify edge
+cases by checking the underlying trace lanes in TensorBoard/Perfetto.
+
 ## TPU ICI hardware counters and host diagnostics (v6e / Trillium)
 
 JAX/XPlane (above) shows **what the program expressed** (collectives, fusion, timeline). On **TPU VMs**, Google’s host-side tooling can additionally expose **hardware performance counters** for the **Inter-Chip Interconnect (ICI)**—useful for a **traffic-matrix / hot-link** story during MoE all-to-all versus steady TP all-reduce.
