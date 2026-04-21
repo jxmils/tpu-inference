@@ -20,7 +20,7 @@ import torch
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from transformers import PretrainedConfig
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.runai_streamer_loader import \
     RunaiModelStreamerLoader
@@ -212,7 +212,9 @@ def _get_nnx_model(
         # Although the created model can already work, we still need to jit
         # the model creation again, otherwise the model forward will have
         # non-trivial overhead in PjitFunction.
-        with jax.set_mesh(mesh):
+        # vLLM's DefaultModelLoader.load_weights may call get_current_vllm_config()
+        # (e.g. _init_ep_weight_filter); keep config in context for that path.
+        with jax.set_mesh(mesh), set_current_vllm_config(vllm_config):
             loader = get_model_loader(vllm_config.load_config)
             if isinstance(model, LoadableWithIterator):
                 assert isinstance(model, JaxModule)
