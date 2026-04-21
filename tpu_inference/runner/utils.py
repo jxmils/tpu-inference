@@ -18,6 +18,7 @@ from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 from tpu_inference import envs
 from tpu_inference.logger import init_logger
 from tpu_inference.runner.input_batch import InputBatch
+from tpu_inference.runner.request_trace import trace_clock_fields
 
 MIN_NUM_SEQS = 8
 
@@ -324,12 +325,14 @@ class PhasedBasedProfiler:
         now = datetime.datetime.now()
         date_string_in_profiler_format = now.strftime("%Y_%m_%d_%H_%M_%S_%f")
 
+        payload = dict(batch_composition_stats)
+        payload.update(trace_clock_fields())
         with open(
                 os.path.join(
                     self.profile_dir_with_phase_suffix,
                     f"batch_composition_stats_{date_string_in_profiler_format}.json"
                 ), "w") as f:
-            f.write(json.dumps(batch_composition_stats) + "\n")
+            f.write(json.dumps(payload, sort_keys=True) + "\n")
 
     def _start_profiling(self, batch_composition_stats: dict) -> None:
         """

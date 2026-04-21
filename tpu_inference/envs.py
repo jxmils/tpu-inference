@@ -245,7 +245,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # libtpu.sdk.tpumonitoring snapshots around model_fn (see docs/profiling.md).
     "CAPTURE_ICI_TPUMONITORING":
     env_bool("CAPTURE_ICI_TPUMONITORING", default=False),
-    # Comma-separated metric names for tpumonitoring.get_metric (TPU / version specific).
+    # Comma-separated names for tpumonitoring (default: flit counters). Many v6e
+    # libtpu builds do not populate ici_flits_* in-process; use host
+    # scripts/tpu/ici_counters.sh + tpu-info for flits there (see docs/profiling.md).
     "ICI_TPUMONITORING_METRICS":
     lambda: os.getenv("ICI_TPUMONITORING_METRICS",
                       "ici_flits_tx,ici_flits_rx"),

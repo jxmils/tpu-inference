@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Read traces/raw_traces JSONL (step, hbm, summary) and optional raw NPZ routing
-dumps; write many PDF figures under ./results/ by default.
+dumps; write many PDF figures under ./results/ by default. When ``--traces-dir``
+ends with ``raw_traces`` inside a ``tpu_trace_bundle``, also plots Chrome/JAX
+trace comm vs compute, HLO module family counts, HBM execute brackets, and
+ICI overlays (unless ``--skip-bundle-extras``).
 
 Includes paper-style figures:
   (a) Stacked expert dispatch (MB) vs trace_step from routing summary.
@@ -14,7 +17,12 @@ Includes paper-style figures:
 Usage:
   python plot_raw_traces.py
   python plot_raw_traces.py --traces-dir /path/to/raw_traces --out-dir /path/to/out
-  python plot_raw_traces.py --paper-layer 4 --paper-heatmap-max-experts 24
+
+By default this generates **all** standard figures (routing, paper stacks, expert×expert
+heatmaps for **every** MoE layer found in ``raw/routing_raw_*.npz``, EP-ragged A2A
+attempts when keys exist, and bundle extras when ``raw_traces`` sits under ``tpu_trace_bundle``).
+Override with ``--paper-layer N`` for a single layer only, or ``--skip-ep-ragged-a2a`` /
+``--skip-bundle-extras`` to save time or disk.
 """
 
 from __future__ import annotations
@@ -41,6 +49,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+import plot_bundle_extras as _bundle
 
 
 def _repo_root() -> Path:
@@ -107,6 +117,35 @@ def _discover_layer_keys(z: Any) -> list[int]:
         if m:
             layers.add(int(m.group(1)))
     return sorted(layers)
+
+
+def _discover_moe_layer_indices(traces_dir: Path) -> list[int]:
+    """MoE layer indices present in ``raw/routing_raw_*.npz`` (first file that loads)."""
+    paths = sorted(
+        traces_dir.glob("raw/routing_raw_*.npz"),
+        key=lambda p: (_raw_npz_step_from_name(p.name) or -1, p.name),
+    )
+    for p in paths:
+        z = None
+        try:
+            z = np.load(p, mmap_mode="r")
+            layers = _discover_layer_keys(z)
+            if layers:
+                return layers
+        except (OSError, ValueError):
+            continue
+        finally:
+            if z is not None:
+                z.close()
+    return []
+
+
+def _paper_heatmap_layer_list(traces_dir: Path, paper_layer: int) -> list[int]:
+    """``paper_layer < 0`` → all layers from NPZ; else single layer index."""
+    if paper_layer >= 0:
+        return [paper_layer]
+    found = _discover_moe_layer_indices(traces_dir)
+    return found if found else [0]
 
 
 def _pair_matrix_topk_slots(
@@ -202,10 +241,15 @@ def _aggregate_raw_pair_by_trace_step(
 
 
 def _crop_expert_indices(matrices: list[np.ndarray], max_experts: int) -> np.ndarray:
-    """Return sorted expert indices to keep (by total in+out mass)."""
-    if not matrices or max_experts <= 0:
+    """Return sorted expert indices to keep (by total in+out mass).
+
+    ``max_experts <= 0`` keeps **all** experts (no crop).
+    """
+    if not matrices:
         return np.arange(0)
     e = max(m.shape[0] for m in matrices)
+    if max_experts <= 0 or max_experts >= e:
+        return np.arange(e, dtype=int)
     mass = np.zeros(e, dtype=np.float64)
     for m in matrices:
         ee = m.shape[0]
@@ -215,8 +259,21 @@ def _crop_expert_indices(matrices: list[np.ndarray], max_experts: int) -> np.nda
     return np.sort(keep)
 
 
+def _row_normalize_2d(mat: np.ndarray) -> np.ndarray:
+    """Row-normalize a 2D matrix; zero rows remain zero."""
+    arr = np.asarray(mat, dtype=np.float64)
+    if arr.ndim != 2 or arr.size == 0:
+        return np.asarray(arr, dtype=np.float64)
+    den = arr.sum(axis=1, keepdims=True)
+    out = np.zeros_like(arr, dtype=np.float64)
+    np.divide(arr, den, out=out, where=den > 0)
+    return out
+
+
 def _read_one_summary(p: Path) -> pd.DataFrame:
     df = pd.read_json(p, lines=True)
+    if not df.empty and "record_type" in df.columns:
+        df = df[df["record_type"].astype("string") != "routing_write_meta"]
     df["_source_file"] = p.name
     return df
 
@@ -1605,11 +1662,6 @@ def plot_step_series(df: pd.DataFrame, out_dir: Path, prefix: str = "step") -> l
                     "(dispatch+return)/2 proxy / model_forward_wall_time_s (GB/s)",
                     "eff_bw_proxy_dispatch_gbps",
                 ),
-                (
-                    "comm_bytes_proxy_total",
-                    "comm_bytes_proxy_total / model_forward_wall_time_s (GB/s)",
-                    "eff_bw_proxy_comm_unified_gbps",
-                ),
             ):
                 if byte_col not in s.columns:
                     continue
@@ -2235,6 +2287,23 @@ def plot_paper_style_expert_pair_heatmaps(
     fig.colorbar(im, ax=list(axes.flat), shrink=0.55, label="MB")
     saved.append(_save(fig, out_dir, f"{prefix}_expert_pair_heatmaps_layer{layer_idx}"))
 
+    # Normalized view (row-wise share by source expert)
+    fig_n, axes_n = plt.subplots(1, 4, figsize=(16, 4), constrained_layout=True)
+    normed = [_row_normalize_2d(m) for m in cropped]
+    for ax, st, mat_n in zip(axes_n, pick_steps, normed):
+        im_n = ax.imshow(
+            mat_n, aspect="equal", interpolation="nearest", vmin=0.0, vmax=1.0
+        )
+        ax.set_title(f"step {st} (row-norm)")
+        ax.set_xlabel("expert j")
+        ax.set_ylabel("expert i")
+    fig_n.suptitle(
+        f"Expert×expert routing proxy (row-normalized), layer_idx={layer_idx}",
+        fontsize=11,
+    )
+    fig_n.colorbar(im_n, ax=list(axes_n.flat), shrink=0.55, label="fraction of src expert mass")
+    saved.append(_save(fig_n, out_dir, f"{prefix}_expert_pair_heatmaps_norm_layer{layer_idx}"))
+
     # Symmetrized view (closer visual to some MoE analyses)
     fig2, axes2 = plt.subplots(1, 4, figsize=(16, 4), constrained_layout=True)
     sym_max = 0.0
@@ -2341,6 +2410,26 @@ def plot_ep_ragged_a2a_heatmaps(traces_dir: Path, out_dir: Path) -> list[Path]:
             fig.tight_layout()
             saved.append(
                 _save(fig, out_dir, f"ep_ragged_a2a_{stem}_layer{lid}"))
+            # Also save normalized (row-wise) variants to highlight shard traffic shares.
+            d_norm = _row_normalize_2d(d)
+            r_norm = _row_normalize_2d(r) if r is not None else None
+            fig_n, axes_n = plt.subplots(1, ncols, figsize=(5.2 * ncols, 4.2))
+            axn = np.atleast_1d(axes_n)
+            imn0 = axn[0].imshow(d_norm, aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0)
+            axn[0].set_title("dispatch share (row-normalized)")
+            axn[0].set_xlabel("dst expert shard")
+            axn[0].set_ylabel("src expert shard")
+            fig_n.colorbar(imn0, ax=axn[0], fraction=0.046, pad=0.04)
+            if r_norm is not None and ncols == 2:
+                imn1 = axn[1].imshow(r_norm, aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0)
+                axn[1].set_title("return share (row-normalized)")
+                axn[1].set_xlabel("dst expert shard")
+                axn[1].set_ylabel("src expert shard")
+                fig_n.colorbar(imn1, ax=axn[1], fraction=0.046, pad=0.04)
+            fig_n.suptitle(f"{npz_path.name}  layer {lid}  (normalized)", fontsize=10)
+            fig_n.tight_layout()
+            saved.append(
+                _save(fig_n, out_dir, f"ep_ragged_a2a_norm_{stem}_layer{lid}"))
     return saved
 
 
@@ -2367,14 +2456,14 @@ def main() -> int:
     parser.add_argument(
         "--paper-layer",
         type=int,
-        default=0,
-        help="Layer index for paper-style expert×expert NPZ heatmaps",
+        default=-1,
+        help="Expert×expert NPZ heatmaps: layer index, or -1 (default) for **all** MoE layers.",
     )
     parser.add_argument(
         "--paper-heatmap-max-experts",
         type=int,
-        default=32,
-        help="Crop heatmaps to this many busiest experts (for large E)",
+        default=0,
+        help="Crop heatmaps to this many busiest experts; 0 (default) = show all experts.",
     )
     parser.add_argument(
         "--routing-chunk-lines",
@@ -2388,9 +2477,9 @@ def main() -> int:
         help="Load entire routing summary into RAM (fast for small runs; can OOM on huge summary/)",
     )
     parser.add_argument(
-        "--plot-ep-ragged-a2a",
+        "--skip-ep-ragged-a2a",
         action="store_true",
-        help="If raw/routing_raw_*.npz contains ep_ragged_a2a_* arrays, write shard×shard heatmaps",
+        help="Skip shard×shard EP ragged A2A heatmaps (on by default when NPZ keys exist).",
     )
     parser.add_argument(
         "--expert-count",
@@ -2416,6 +2505,30 @@ def main() -> int:
         default=None,
         help="Bytes/element for expert weights (default: infer from traces else 2)",
     )
+    parser.add_argument(
+        "--bundle-dir",
+        type=Path,
+        default=None,
+        help="Directory containing raw_traces/, vllm_jax_profiles/, hlo_dumps/. "
+        "Default: parent of --traces-dir when it is named raw_traces.",
+    )
+    parser.add_argument(
+        "--skip-bundle-extras",
+        action="store_true",
+        help="Skip Chrome trace, HLO family counts, HBM brackets, ICI overlay plots.",
+    )
+    parser.add_argument(
+        "--benchmark-json",
+        type=Path,
+        default=None,
+        help="Optional JSON: benchmark_duration_s or duration_s; successful_requests or num_prompts.",
+    )
+    parser.add_argument(
+        "--hlo-max-dirs",
+        type=int,
+        default=50_000,
+        help="Max HLO dump subdirs to classify for bundle-extra plots (default: high cap).",
+    )
     args = parser.parse_args()
     traces_dir: Path = args.traces_dir.expanduser().resolve()
     out_dir: Path = args.out_dir.expanduser().resolve()
@@ -2431,6 +2544,42 @@ def main() -> int:
     all_saved: list[Path] = []
     all_saved.extend(plot_step_series(step, out_dir))
     all_saved.extend(plot_hbm(hbm, out_dir))
+
+    if not args.skip_bundle_extras:
+        bundle: Path | None = None
+        if args.bundle_dir is not None:
+            bundle = args.bundle_dir.expanduser().resolve()
+        else:
+            bundle = _bundle.resolve_bundle_root(traces_dir)
+        if bundle is not None and bundle.is_dir():
+            has_prof = (bundle / "vllm_jax_profiles").is_dir()
+            has_hlo = (bundle / "hlo_dumps").is_dir()
+            if has_prof or has_hlo:
+                print(f"Bundle extras under {bundle}")
+            tp = _bundle.discover_chrome_trace(bundle) if has_prof else None
+            if tp is not None:
+                print(f"  profile trace: {tp}")
+                all_saved.extend(_bundle.plot_perfetto_comm_compute(tp, out_dir))
+            if has_hlo:
+                all_saved.extend(
+                    _bundle.plot_hlo_module_families(
+                        bundle / "hlo_dumps",
+                        out_dir,
+                        max_dirs=args.hlo_max_dirs,
+                    )
+                )
+            all_saved.extend(_bundle.plot_hbm_execute_brackets(hbm, out_dir))
+            all_saved.extend(_bundle.plot_ici_from_step(step, out_dir))
+            all_saved.extend(_bundle.plot_step_comm_ici_overlay(step, out_dir))
+            if args.benchmark_json is not None:
+                pbj = args.benchmark_json.expanduser().resolve()
+                if pbj.is_file():
+                    bench = json.loads(pbj.read_text(encoding="utf-8"))
+                    all_saved.extend(
+                        _bundle.plot_benchmark_engine_utilization(
+                            step, bench, out_dir
+                        )
+                    )
 
     runtime_expert_capacity = _load_runtime_expert_capacity(traces_dir)
     if runtime_expert_capacity is not None:
@@ -2470,6 +2619,12 @@ def main() -> int:
             "(need --expert-intermediate-size; expert count/hidden size can be inferred)."
         )
 
+    heatmap_layers = _paper_heatmap_layer_list(traces_dir, args.paper_layer)
+    print(
+        f"  expert×expert heatmap layers: {heatmap_layers} "
+        f"(use --paper-layer N for a single layer)"
+    )
+
     if args.legacy_full_routing_load:
         routing = _load_routing_summary(traces_dir, args.max_summary_files)
         print(
@@ -2478,16 +2633,17 @@ def main() -> int:
         )
         all_saved.extend(plot_routing(routing, out_dir))
         all_saved.extend(plot_paper_style_stacked_expert_volume(routing, out_dir))
-        all_saved.extend(
-            plot_paper_style_expert_pair_heatmaps(
-                traces_dir,
-                out_dir,
-                layer_idx=args.paper_layer,
-                max_experts_display=args.paper_heatmap_max_experts,
+        for lid in heatmap_layers:
+            all_saved.extend(
+                plot_paper_style_expert_pair_heatmaps(
+                    traces_dir,
+                    out_dir,
+                    layer_idx=lid,
+                    max_experts_display=args.paper_heatmap_max_experts,
+                )
             )
-        )
         all_saved.extend(plot_step_vs_routing(step, routing, out_dir))
-        if args.plot_ep_ragged_a2a:
+        if not args.skip_ep_ragged_a2a:
             all_saved.extend(plot_ep_ragged_a2a_heatmaps(traces_dir, out_dir))
     else:
         print(
@@ -2508,16 +2664,17 @@ def main() -> int:
             )
         )
         all_saved.extend(plot_paper_stacked_from_agg(agg, out_dir))
-        all_saved.extend(
-            plot_paper_style_expert_pair_heatmaps(
-                traces_dir,
-                out_dir,
-                layer_idx=args.paper_layer,
-                max_experts_display=args.paper_heatmap_max_experts,
+        for lid in heatmap_layers:
+            all_saved.extend(
+                plot_paper_style_expert_pair_heatmaps(
+                    traces_dir,
+                    out_dir,
+                    layer_idx=lid,
+                    max_experts_display=args.paper_heatmap_max_experts,
+                )
             )
-        )
         all_saved.extend(plot_step_vs_routing_agg(step, agg, out_dir))
-        if args.plot_ep_ragged_a2a:
+        if not args.skip_ep_ragged_a2a:
             all_saved.extend(plot_ep_ragged_a2a_heatmaps(traces_dir, out_dir))
 
     print(f"Wrote {len(all_saved)} PDFs under {out_dir}")

@@ -303,6 +303,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._last_model_forward_wall_time_s: float | None = None
         # Wall time for the last `compute_logits_fn` call (host); LM head vs body.
         self._last_compute_logits_wall_time_s: float | None = None
+        self._last_prepare_inputs_wall_time_s: float | None = None
+        self._last_mm_encoder_wall_time_s: float | None = None
+        self._last_get_input_ids_embeds_wall_time_s: float | None = None
+        self._last_execute_model_host_wall_time_s: float | None = None
+        self._last_ici_hw_host_window_wall_time_s: float | None = None
         self._trace_step_stride = int(envs.TRACE_STEP_STRIDE)
         self._persist_hbm_snapshot("runner_initialized")
 
@@ -564,6 +569,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self._last_model_forward_wall_time_s,
             "compute_logits_wall_time_s":
             self._last_compute_logits_wall_time_s,
+            "prepare_inputs_wall_time_s":
+            self._last_prepare_inputs_wall_time_s,
+            "mm_encoder_wall_time_s":
+            self._last_mm_encoder_wall_time_s,
+            "get_input_ids_embeds_wall_time_s":
+            self._last_get_input_ids_embeds_wall_time_s,
+            "execute_model_host_wall_time_s":
+            self._last_execute_model_host_wall_time_s,
+            "ici_hw_host_window_wall_time_s":
+            self._last_ici_hw_host_window_wall_time_s,
         }
         rec.update(self._extract_kv_connector_stats(scheduler_output))
         if (self._ici_hw_capture is not None and self._ici_hw_before is not None
@@ -1212,6 +1227,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         # TODO(pooyam): I guess we can remove returning sampling_metadata in `_prepare_inputs` after https://github.com/njhill/vllm/commit/b7433ca1a47732394b1bdea4099d98389515954b
+        t_execute0 = time.perf_counter()
+        self._last_prepare_inputs_wall_time_s = None
+        self._last_mm_encoder_wall_time_s = None
+        self._last_get_input_ids_embeds_wall_time_s = None
+        self._last_execute_model_host_wall_time_s = None
+        self._last_ici_hw_host_window_wall_time_s = None
+
+        _t_prepare = time.perf_counter()
         (
             input_ids,
             input_positions,
@@ -1222,6 +1245,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices_selector,
             padded_num_reqs,
         ) = self._prepare_inputs(scheduler_output)
+        self._last_prepare_inputs_wall_time_s = (
+            time.perf_counter() - _t_prepare)
         self._last_compute_logits_wall_time_s = None
         step_trace_extra = {
             "num_active_reqs": int(self.input_batch.num_reqs),
@@ -1233,11 +1258,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                    extra=step_trace_extra)
 
         # multi-modal support
+        self._last_mm_encoder_wall_time_s = None
         if self.is_multimodal_model:
             # Run the multimodal encoder if any.
             # We have the modality embeds at this time.
             with jax.profiler.TraceAnnotation("vllm:mm_encoder"):
+                _t_mm = time.perf_counter()
                 self.mm_manager.execute_mm_encoder(scheduler_output)
+                self._last_mm_encoder_wall_time_s = (
+                    time.perf_counter() - _t_mm)
             mm_embeds = self.mm_manager.gather_mm_embeddings(
                 scheduler_output, input_ids.shape[0])
         else:
@@ -1248,8 +1277,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Later, the multi-modality model will take the embedding as the input.
         # For text-only model, this does nothing. It will input the input_ids and
         # leave the mebedding job inside the forward pass
+        _t_embeds = time.perf_counter()
         input_ids, inputs_embeds = self._get_input_ids_embeds(
             input_ids, mm_embeds)
+        self._last_get_input_ids_embeds_wall_time_s = (
+            time.perf_counter() - _t_embeds)
 
         lora_metadata = self.lora_utils.extract_lora_metadata()
         # TODO: make _get_input_ids_embeds within this context
@@ -1264,6 +1296,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output) as kv_connector_output:
                 # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
                 # but one of them would be `None`
+                _t_ici_host = time.perf_counter()
                 if self._ici_hw_capture is not None:
                     self._ici_hw_before = self._ici_hw_capture.snapshot()
                 else:
@@ -1290,8 +1323,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     self._block_until_ready_for_hbm(
                         (self.kv_caches, hidden_states))
                     self._ici_hw_after = self._ici_hw_capture.snapshot()
+                    self._last_ici_hw_host_window_wall_time_s = (
+                        time.perf_counter() - _t_ici_host)
                 else:
                     self._ici_hw_after = None
+                    self._last_ici_hw_host_window_wall_time_s = None
             routing_stats = None
             if isinstance(aux_hidden_states, tuple) and len(
                     aux_hidden_states) == 2:
@@ -1301,6 +1337,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
+                self._last_execute_model_host_wall_time_s = (
+                    time.perf_counter() - t_execute0)
                 self._persist_hbm_snapshot("after_execute_model",
                                            sync_obj=hidden_states,
                                            extra=step_trace_extra)
@@ -1317,6 +1355,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     pooling_metadata,
                     seq_lens,
                 )
+                self._last_execute_model_host_wall_time_s = (
+                    time.perf_counter() - t_execute0)
                 self._persist_hbm_snapshot("after_execute_model",
                                            sync_obj=pooler_output,
                                            extra=step_trace_extra)
@@ -1342,6 +1382,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 )
                 self._last_compute_logits_wall_time_s = (
                     time.perf_counter() - _t_logits)
+        self._last_execute_model_host_wall_time_s = (
+            time.perf_counter() - t_execute0)
         self._persist_hbm_snapshot("after_execute_model",
                                    sync_obj=logits,
                                    extra=step_trace_extra)

@@ -7,16 +7,27 @@
 # expert-parallel all-to-all.
 # NOTE: you will need the tensorboard-plugin-profile python package to
 # visualize the results in TensorBoard.
-# Please see docs/profiler.md for more details.
-# Usage example for prefilling 1 request of 1024 tokens:
-# python3 examples/tpu_profiling.py --input-len 1024 --output-len 1   --batch-size 1
-# Usage example for decoding 256 requests of 1 token each:
-# python3 examples/tpu_profiling.py --input-len 1 --output-len 1 --batch-size=256
+# Please see docs/profiling.md for more details.
+#
+# If you see "unrecognized arguments: --profile-scenario", this file on the VM
+# is stale — run `git pull` in the repo (or use the explicit --input-len lines).
+# Same presets via env: export TPU_PROFILING_SCENARIO=prefill|decode
+#
+# Presets (recommended): pass --model and any EngineArgs (TP size, etc.).
+#   Prefill-heavy — 1 request, 1024 prompt tokens, 1 generated token:
+#     python3 examples/tpu_profiling.py --profile-scenario prefill --model google/gemma-2b
+#   Decode-heavy — 256 requests, 1 prompt + 1 output token each:
+#     python3 examples/tpu_profiling.py --profile-scenario decode --model google/gemma-2b
+#
+# Same shapes without --profile-scenario:
+#   python3 examples/tpu_profiling.py --model google/gemma-2b --input-len 1024 --output-len 1 --batch-size 1
+#   python3 examples/tpu_profiling.py --model google/gemma-2b --input-len 1 --output-len 1 --batch-size 256
 
 import argparse
 import dataclasses
 import os
 import time
+from typing import Any
 
 import numpy as np
 from tqdm import tqdm
@@ -29,7 +40,45 @@ DURATION_MS = int(os.getenv("VLLM_TPU_PROFILE_DURATION_MS", 3000))
 DELAY_MS = int(os.getenv("VLLM_TPU_PROFILE_DELAY_MS", 0))
 
 
+def _normalize_compilation_config_for_llm_init(llm_kwargs: dict[str, Any]) -> None:
+    """Argparse/EngineArgs can leave None where vLLM's Pydantic CompilationConfig expects values.
+
+    Seen on TPU: ``cudagraph_capture_sizes`` must be a list; ``pass_config.fuse_minimax_qk_norm``
+    must be a bool (not None).
+    """
+    cc = llm_kwargs.get("compilation_config")
+    if not isinstance(cc, dict):
+        return
+    if cc.get("cudagraph_capture_sizes") is None:
+        cc["cudagraph_capture_sizes"] = []
+    pc = cc.get("pass_config")
+    if not isinstance(pc, dict):
+        pc = {}
+        cc["pass_config"] = pc
+    if pc.get("fuse_minimax_qk_norm") is None:
+        pc["fuse_minimax_qk_norm"] = False
+
+
+def _apply_profile_scenario(args: argparse.Namespace) -> None:
+    """Match docs/profiling.md canonical prefill vs decode profiling shapes."""
+    scenario = getattr(args, "profile_scenario", None)
+    if scenario is None:
+        env_scenario = os.environ.get("TPU_PROFILING_SCENARIO")
+        if env_scenario in ("prefill", "decode"):
+            scenario = env_scenario
+            args.profile_scenario = env_scenario
+    if scenario == "prefill":
+        args.input_len = 1024
+        args.output_len = 1
+        args.batch_size = 1
+    elif scenario == "decode":
+        args.input_len = 1
+        args.output_len = 1
+        args.batch_size = 256
+
+
 def main(args: argparse.Namespace):
+    _apply_profile_scenario(args)
     print(args)
 
     # Profile
@@ -42,7 +91,9 @@ def main(args: argparse.Namespace):
     args.profiler_config = profiler_config
 
     engine_args = EngineArgs.from_cli_args(args)
-    llm = LLM(**dataclasses.asdict(engine_args))
+    llm_kwargs = dataclasses.asdict(engine_args)
+    _normalize_compilation_config_for_llm_init(llm_kwargs)
+    llm = LLM(**llm_kwargs)
 
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -114,6 +165,17 @@ def parse_args():
     )
 
     parser = EngineArgs.add_cli_args(parser)
+    # Register after EngineArgs so vLLM's parser keeps owning standard flags.
+    parser.add_argument(
+        "--profile-scenario",
+        choices=("prefill", "decode"),
+        default=None,
+        help=(
+            "Workload preset: prefill => input_len=1024, output_len=1, batch_size=1; "
+            "decode => input_len=1, output_len=1, batch_size=256. "
+            "Overrides --input-len, --output-len, and --batch-size. "
+            "Same as env TPU_PROFILING_SCENARIO=prefill|decode when unset."),
+    )
     return parser.parse_args()
 
 

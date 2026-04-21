@@ -24,6 +24,7 @@ import jax
 import numpy as np
 
 from tpu_inference.logger import init_logger
+from tpu_inference.runner.request_trace import trace_clock_fields
 
 logger = init_logger(__name__)
 
@@ -99,6 +100,9 @@ class RoutingTraceWriter:
               rank: int | None = None,
               request_seq_ids: Dict[str, Any] | None = None,
               phase_override: Optional[str] = None) -> None:
+        t_write0 = time.perf_counter()
+        # Wall clock for this batch (aligned raw npz + summary jsonl on disk).
+        clock0 = trace_clock_fields()
         per_layer = routing_stats.get("per_layer", [])
         aggregate = routing_stats.get("aggregate", {})
         per_layer_np = _to_numpy_pytree(per_layer)
@@ -107,26 +111,66 @@ class RoutingTraceWriter:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         rank_suffix = f"_rank{rank}" if rank is not None else ""
         suffix = f"step{trace_step}_batch{batch_id}{rank_suffix}_{timestamp}"
-        # Wall time at capture (same for raw + summary) for multi-rank / multi-host alignment.
-        timestamp_unix = time.time()
-
-        if self.save_raw:
-            self._write_raw_npz(per_layer_np, aggregate_np, batch_meta, suffix,
-                                trace_step, batch_id, rank, timestamp_unix)
-        if self.save_summary:
-            self._write_summary_jsonl(per_layer_np, batch_meta, suffix,
-                                      request_seq_ids, phase_override,
-                                      trace_step, batch_id, rank, timestamp_unix)
 
         self._run_invariants(per_layer_np, aggregate_np, batch_meta)
+        raw_path: str | None = None
+        if self.save_raw:
+            raw_path = self._write_raw_npz(
+                per_layer_np,
+                aggregate_np,
+                batch_meta,
+                suffix,
+                trace_step,
+                batch_id,
+                rank,
+                clock0,
+            )
+        if self.save_summary:
+            self._write_summary_jsonl(
+                per_layer_np,
+                batch_meta,
+                suffix,
+                request_seq_ids,
+                phase_override,
+                trace_step,
+                batch_id,
+                rank,
+                clock0,
+            )
+        write_host_total_s = time.perf_counter() - t_write0
+        if raw_path is not None and os.path.isfile(raw_path):
+            merge_clk = trace_clock_fields()
+            with np.load(raw_path, allow_pickle=True) as z:
+                merged: Dict[str, Any] = {k: z[k] for k in z.files}
+            merged["routing_trace_write_host_total_s"] = np.asarray(
+                [float(write_host_total_s)], dtype=np.float64)
+            merged["npz_merged_at_timestamp_unix"] = np.asarray(
+                [float(merge_clk["timestamp_unix"])], dtype=np.float64)
+            merged["npz_merged_at_timestamp_unix_ns"] = np.asarray(
+                [int(merge_clk["timestamp_unix_ns"])], dtype=np.int64)
+            merged["npz_merged_at_monotonic_time_ns"] = np.asarray(
+                [int(merge_clk["monotonic_time_ns"])], dtype=np.int64)
+            merged["npz_merged_at_timestamp_iso_utc"] = np.array(
+                [str(merge_clk["timestamp_iso_utc"])], dtype=object)
+            np.savez_compressed(raw_path, **merged)
+        if self.save_summary:
+            self._append_routing_summary_meta(
+                os.path.join(self._summary_dir, f"routing_summary_{suffix}.jsonl"),
+                trace_step=trace_step,
+                batch_id=batch_id,
+                rank=rank,
+                clock0=clock0,
+                write_host_total_s=write_host_total_s,
+            )
 
     def _write_raw_npz(self, per_layer: List[dict | None],
                        aggregate: Dict[str, Any],
                        batch_meta: RoutingTraceBatchMeta, suffix: str,
-                       trace_step: int, batch_id: int,
-                       rank: int | None, timestamp_unix: float) -> None:
+                       trace_step: int, batch_id: int, rank: int | None,
+                       clock0: Dict[str, Any]) -> str:
         raw_path = os.path.join(self._raw_dir,
                                 f"routing_raw_{suffix}.npz")
+        timestamp_unix = float(clock0["timestamp_unix"])
 
         raw: Dict[str, Any] = {
             "req_ids":
@@ -151,6 +195,12 @@ class RoutingTraceWriter:
             np.asarray([-1 if rank is None else rank], dtype=np.int32),
             "timestamp_unix":
             np.asarray([timestamp_unix], dtype=np.float64),
+            "timestamp_unix_ns":
+            np.asarray([int(clock0["timestamp_unix_ns"])], dtype=np.int64),
+            "monotonic_time_ns":
+            np.asarray([int(clock0["monotonic_time_ns"])], dtype=np.int64),
+            "timestamp_iso_utc":
+            np.array([str(clock0["timestamp_iso_utc"])], dtype=object),
         }
 
         if aggregate:
@@ -172,13 +222,38 @@ class RoutingTraceWriter:
                 raw[f"layer_{layer_key_idx}_{key}"] = value
 
         np.savez_compressed(raw_path, **raw)
+        return raw_path
+
+    def _append_routing_summary_meta(
+        self,
+        path: str,
+        *,
+        trace_step: int,
+        batch_id: int,
+        rank: int | None,
+        clock0: Dict[str, Any],
+        write_host_total_s: float,
+    ) -> None:
+        """One line per file with end-to-end host time for this routing write."""
+        meta = {
+            **trace_clock_fields(),
+            "record_type": "routing_write_meta",
+            "trace_step": int(trace_step),
+            "batch_id": int(batch_id),
+            "rank": rank,
+            "routing_capture_timestamp_unix_ns": int(
+                clock0["timestamp_unix_ns"]),
+            "routing_trace_write_host_total_s": float(write_host_total_s),
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(meta, sort_keys=True) + "\n")
 
     def _write_summary_jsonl(self, per_layer: List[dict | None],
                              batch_meta: RoutingTraceBatchMeta, suffix: str,
                              request_seq_ids: Dict[str, Any] | None,
-                             phase_override: Optional[str],
-                             trace_step: int, batch_id: int,
-                             rank: int | None, timestamp_unix: float) -> None:
+                             phase_override: Optional[str], trace_step: int,
+                             batch_id: int, rank: int | None,
+                             clock0: Dict[str, Any]) -> None:
         summary_path = os.path.join(self._summary_dir,
                                     f"routing_summary_{suffix}.jsonl")
 
@@ -272,8 +347,6 @@ class RoutingTraceWriter:
                             batch_id,
                             "rank":
                             rank,
-                            "timestamp_unix":
-                            timestamp_unix,
                             "phase":
                             phase,
                             "request_id":
@@ -313,7 +386,10 @@ class RoutingTraceWriter:
                             "routing_is_exact":
                             routing_is_exact,
                         }
-                        f.write(json.dumps(record) + "\n")
+                        record["routing_capture_timestamp_unix_ns"] = int(
+                            clock0["timestamp_unix_ns"])
+                        record.update(trace_clock_fields())
+                        f.write(json.dumps(record, sort_keys=True) + "\n")
 
     def _run_invariants(self, per_layer: List[dict | None],
                         aggregate: Dict[str, Any],

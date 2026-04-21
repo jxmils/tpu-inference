@@ -23,6 +23,7 @@ import numpy as np
 
 from tpu_inference.runner.moe_routing_trace import (RoutingTraceBatchMeta,
                                                     _get_phase_per_req)
+from tpu_inference.runner.request_trace import trace_clock_fields
 
 
 def _ensure_dir(path: str) -> None:
@@ -63,7 +64,6 @@ class HBMTraceWriter:
         free_bytes = [limit - used for used, limit in hbm_usage]
 
         record: Dict[str, Any] = {
-            "timestamp_unix": time.time(),
             "event": event,
             "trace_step": trace_step,
             "rank": -1 if self.rank is None else self.rank,
@@ -112,6 +112,8 @@ class HBMTraceWriter:
 
         if extra:
             record.update(extra)
+
+        record.update(trace_clock_fields())
 
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, sort_keys=True))

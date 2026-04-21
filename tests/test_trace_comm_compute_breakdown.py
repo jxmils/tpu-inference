@@ -58,3 +58,41 @@ def test_summarize_basic(tmp_path):
     assert float(r["overlap_ms"]) == 0.2
     # union(all ops) = [100,700] => 0.6 ms
     assert float(r["total_op_time_ms"]) == 0.6
+
+
+def test_summarize_vllm_uniproc_execute_model_name(tmp_path):
+    """Chrome traces from vLLM may use ``... execute_model`` without ``execute_model:`` prefix."""
+    mod = _load_mod()
+    trace = {
+        "traceEvents": [
+            {
+                "name": "$uniproc_executor.py:102 execute_model",
+                "ph": "X",
+                "ts": 0,
+                "dur": 1000,
+                "cat": "python",
+            },
+            {
+                "name": "dot_general",
+                "cat": "xla",
+                "ph": "X",
+                "ts": 100,
+                "dur": 400,
+            },
+            {
+                "name": "all-reduce",
+                "cat": "xla",
+                "ph": "X",
+                "ts": 300,
+                "dur": 400,
+            },
+        ]
+    }
+    p = tmp_path / "chrome_trace.json"
+    p.write_text(json.dumps(trace), encoding="utf-8")
+    rows = mod.summarize(p)
+    assert len(rows) == 1
+    r = rows[0]
+    assert float(r["comm_time_ms"]) == 0.4
+    assert float(r["compute_time_ms"]) == 0.4
+    assert float(r["overlap_ms"]) == 0.2

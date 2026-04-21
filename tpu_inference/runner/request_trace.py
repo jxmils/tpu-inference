@@ -17,7 +17,23 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+
+def trace_clock_fields() -> Dict[str, Any]:
+    """High-resolution host clocks for every JSONL line (and routing NPZ co-tagged).
+
+    ``timestamp_*`` is comparable across processes/ranks; ``monotonic_time_ns`` is
+    only valid for ordering within a single process.
+    """
+    return {
+        "timestamp_unix": time.time(),
+        "timestamp_unix_ns": time.time_ns(),
+        "monotonic_time_ns": time.perf_counter_ns(),
+        "timestamp_iso_utc": datetime.now(timezone.utc).isoformat(
+            timespec="microseconds"),
+    }
 
 
 def _ensure_dir(path: str) -> None:
@@ -61,7 +77,7 @@ class RequestTraceWriter:
 
     def write(self, record: Dict[str, Any]) -> None:
         payload = dict(record)
-        payload.setdefault("timestamp_unix", time.time())
+        payload.update(trace_clock_fields())
         if self.rank is not None:
             payload.setdefault("rank", self.rank)
         with open(self.path, "a", encoding="utf-8") as f:

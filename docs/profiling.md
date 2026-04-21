@@ -247,12 +247,16 @@ JAX/XPlane (above) shows **what the program expressed** (collectives, fusion, ti
 
 ### In-process ICI snapshots (`libtpu.sdk.tpumonitoring`)
 
+**Traffic story (flits):** the useful fabric counters for “how much moved on ICI” are typically **`ici_flits_tx`** / **`ici_flits_rx`** (or names your **`tpu-info --list_raw_counters`** prints). The runner defaults **`ICI_TPUMONITORING_METRICS`** to those flit names so **`step_summary`** can carry per-step deltas when libtpu exposes them.
+
 **No sidecar:** set **`CAPTURE_ICI_TPUMONITORING=1`**. The runner snapshots selected counters **immediately before** and **immediately after** **`model_fn()`**, with **`jax.block_until_ready`** on **`(kv_caches, hidden_states)`** before the post-forward read so the delta aligns with completed device work. Deltas are written into the same **`step_summary`** JSONL record as **`comm_bytes_proxy_*`**, nested under **`ici_hw_delta`**: for each metric, **`delta_per_chip`** (list) and **`delta_sum`**.
 
-- **`ICI_TPUMONITORING_METRICS`**: comma-separated names (default `ici_flits_tx,ici_flits_rx`). Confirm names with **`tpumonitoring.list_supported_metrics()`** or [Cloud TPU monitoring docs](https://cloud.google.com/tpu/docs/tpu-monitoring-library) for your runtime.
+- **`ICI_TPUMONITORING_METRICS`**: comma-separated names (default **`ici_flits_tx,ici_flits_rx`**). On **v6e / Trillium** we have often seen **`list_supported_metrics()`** omit flit names and **`get_metric("ici_flits_*").data()`** stay **`[]`** — in-process tpumonitoring is then **not** your flit source. For **actual flit telemetry** on those stacks, use **host** **`tpu-info`** / **`scripts/tpu/ici_counters.sh`** (next subsection) in parallel with the benchmark; correlate by wall clock or trace windows. Optional **`ici_link_health`** is a **link diagnostic** (scores in strings), not a substitute for flit volume; you can add it to the comma-separated list if you want both. Confirm any name with **`tpumonitoring.list_supported_metrics()`** in the **same Python as vLLM** (inside the container), or [Cloud TPU monitoring docs](https://cloud.google.com/tpu/docs/tpu-monitoring-library).
 - **Prerequisites for the row:** **`CAPTURE_REQUEST_STATS`** + **`REQUEST_STATS_DIR`** (step trace writer), and the **MoE routing** path that calls **`_persist_step_trace`** — i.e. enable **`CAPTURE_MOE_ROUTING_STATS`** and **`MOE_ROUTING_STATS_DIR`** so **`step_summary`** lines are emitted for those steps.
 
 If **`libtpu.sdk.tpumonitoring`** is not importable, capture is skipped (no error).
+
+**Empty `data()` in a REPL:** `get_metric("ici_link_health").data()` can return **`[]`** in a standalone Python process that has **not** initialized JAX / attached TPU devices. Try again **after** `jax.devices()` (or from code paths that already run inside **`vllm serve`**). The runner snapshots only around **`model_fn`**, so production captures use a process where the TPU client is already live.
 
 **Important:** package names, CLI flags, and **counter spellings change by image generation and diagnostics bundle version**. For host-only workflows, treat the **`tpu-info`** commands below as a **workflow**; always run `tpu-info --help` (or the tool your image ships) and **`--list_raw_counters`** (or equivalent) on **your** node before scripting a paper pipeline.
 
