@@ -203,3 +203,7 @@ shellcheck*/
 csrc/moe/marlin_moe_wna16/kernel_*
 
 !/support_matrices/**
+
+# Generated local benchmark datasets
+tpu_inference/datasets/*/sharegpt_sp*.json
+tpu_inference/datasets/*/manifest.json
