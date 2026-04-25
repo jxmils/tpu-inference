@@ -122,25 +122,19 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
     return _get_bool_env
 
 
-DEFAULT_MOE_ROUTING_STATS_DIR = "/home/jasonmiller"
+DEFAULT_MOE_ROUTING_STATS_DIR = ""
 
 
 def moe_routing_stats_enabled() -> bool:
-    if "CAPTURE_MOE_ROUTING_STATS" not in os.environ:
-        return True
-    return env_bool("CAPTURE_MOE_ROUTING_STATS", default=True)()
+    return env_bool("CAPTURE_MOE_ROUTING_STATS", default=False)()
 
 
 def moe_router_probs_enabled() -> bool:
-    if "CAPTURE_MOE_ROUTER_PROBS" not in os.environ:
-        return True
-    return env_bool("CAPTURE_MOE_ROUTER_PROBS", default=True)()
+    return env_bool("CAPTURE_MOE_ROUTER_PROBS", default=False)()
 
 
 def moe_routing_a2a_enabled() -> bool:
-    if "CAPTURE_MOE_ROUTING_A2A" not in os.environ:
-        return True
-    return env_bool("CAPTURE_MOE_ROUTING_A2A", default=True)()
+    return env_bool("CAPTURE_MOE_ROUTING_A2A", default=False)()
 
 
 def moe_ep_ragged_a2a_matrix_enabled() -> bool:
@@ -170,9 +164,7 @@ def trace_step_stride() -> int:
 
 
 def hbm_stats_enabled() -> bool:
-    if "CAPTURE_HBM_STATS" not in os.environ:
-        return True
-    return env_bool("CAPTURE_HBM_STATS", default=True)()
+    return env_bool("CAPTURE_HBM_STATS", default=False)()
 
 
 def hbm_stats_dir() -> str:
@@ -182,9 +174,7 @@ def hbm_stats_dir() -> str:
 
 
 def request_stats_enabled() -> bool:
-    if "CAPTURE_REQUEST_STATS" not in os.environ:
-        return True
-    return env_bool("CAPTURE_REQUEST_STATS", default=True)()
+    return env_bool("CAPTURE_REQUEST_STATS", default=False)()
 
 
 def request_stats_dir() -> str:
