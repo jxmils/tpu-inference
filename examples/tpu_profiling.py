@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Implements profiling for vLLM on TPU VMs using the JAX profiler.
 # With --profiler-config profiler=torch, the worker uses jax.profiler.start_trace
-# / stop_trace (not PyTorch autograd). Traces are XPlane-compatible and show
-# on-device work on the TPU ICI, including tensor-parallel all-reduce and MoE
-# expert-parallel all-to-all.
+# / stop_trace (not PyTorch autograd). Output is XPlane-compatible (TensorBoard /
+# Perfetto). Per-device tracks are XLA-oriented: collectives that use the ICI
+# appear as device time and op names (e.g. fusion-wrapped comms, barrier-cores),
+# not a separate ICI link counter. TP all-reduce / MoE EP all-to-all only show up
+# when compiled into the step; dense models have no EP all-to-all.
 # NOTE: you will need the tensorboard-plugin-profile python package to
 # visualize the results in TensorBoard.
 # Please see docs/profiling.md for more details.

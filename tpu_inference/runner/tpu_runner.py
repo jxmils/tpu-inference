@@ -315,6 +315,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._routing_trace_writer: RoutingTraceWriter | None = None
         self._routing_trace_batch_meta: RoutingTraceBatchMeta | None = None
         self._expert_capacity_writer: RequestTraceWriter | None = None
+        self._expert_placement_writer: RequestTraceWriter | None = None
+        self._expert_placement_snapshot_written: bool = False
         self._routing_trace_step: int = 0
         capture_routing_stats = envs.moe_routing_stats_enabled()
         routing_stats_dir = envs.moe_routing_stats_dir()
@@ -330,6 +332,100 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 filename_prefix="expert_capacity",
                 rank=self.rank,
             )
+            self._expert_placement_writer = RequestTraceWriter(
+                routing_stats_dir,
+                subdir="summary",
+                filename_prefix="expert_placement",
+                rank=self.rank,
+            )
+            self._persist_expert_placement_snapshot()
+
+    def _infer_total_experts_from_config(self) -> int | None:
+        hf_cfg = getattr(self.model_config, "hf_config", None)
+        if hf_cfg is None:
+            return None
+        for key in ("num_experts", "num_local_experts", "n_routed_experts"):
+            v = getattr(hf_cfg, key, None)
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                continue
+            if iv > 1:
+                return iv
+        return None
+
+    def _persist_expert_placement_snapshot(self) -> None:
+        """Persist a one-time map of mesh devices to expert-shard ranges.
+
+        This is derived from mesh/sharding metadata at runner init time.
+        """
+        if self._expert_placement_writer is None or self._expert_placement_snapshot_written:
+            return
+
+        mesh = self.mesh
+        axis_names = tuple(str(a) for a in getattr(mesh, "axis_names", ()))
+        devices_array = np.asarray(mesh.devices)
+        mesh_shape = tuple(int(x) for x in devices_array.shape)
+        sc: ShardingConfigManager = self.vllm_config.sharding_config
+        ep_size = int(sc.expert_size)
+        total_experts = self._infer_total_experts_from_config()
+
+        expert_axis_pos = axis_names.index("expert") if "expert" in axis_names else None
+        shard_span = None
+        if total_experts is not None and ep_size > 0:
+            shard_span = int(math.ceil(total_experts / ep_size))
+
+        placements: list[dict[str, Any]] = []
+        for flat_idx, idx in enumerate(np.ndindex(mesh_shape)):
+            dev = devices_array[idx]
+            coord = {axis_names[i]: int(idx[i]) for i in range(len(axis_names))}
+
+            expert_shard_index = (
+                int(idx[expert_axis_pos]) if expert_axis_pos is not None else None
+            )
+            expert_range_start = None
+            expert_range_end = None
+            if (expert_shard_index is not None and shard_span is not None
+                    and total_experts is not None):
+                start = int(expert_shard_index * shard_span)
+                end = int(min(total_experts, start + shard_span))
+                if start < end:
+                    expert_range_start = start
+                    expert_range_end = end
+
+            placements.append({
+                "flat_device_index": int(flat_idx),
+                "device_id": int(getattr(dev, "id", -1)),
+                "platform": str(getattr(dev, "platform", "")),
+                "device_kind": str(getattr(dev, "device_kind", "")),
+                "process_index": int(getattr(dev, "process_index", -1)),
+                "coords": coord,
+                "expert_shard_index": expert_shard_index,
+                "expert_range_start": expert_range_start,
+                "expert_range_end_exclusive": expert_range_end,
+            })
+
+        self._expert_placement_writer.write({
+            "record_type": "expert_placement_map",
+            "trace_step": int(self._routing_trace_step),
+            "model": self.model_config.model,
+            "architectures": getattr(self.model_config.hf_config, "architectures", []),
+            "mesh_axis_names": list(axis_names),
+            "mesh_shape": list(mesh_shape),
+            "tp_size": int(sc.tp_size),
+            "ep_size": ep_size,
+            "attn_dp_size": int(sc.attn_dp_size),
+            "attn_dp_expert_size": int(sc.attn_dp_expert_size),
+            "model_dp_size": int(sc.model_dp_size),
+            "total_experts": total_experts,
+            "placements": placements,
+            "note": (
+                "expert_range_* is derived from expert-axis shard index and EP size "
+                "using contiguous ceil partition; verify against model-specific routing "
+                "logic if custom expert layout is enabled."
+            ),
+        })
+        self._expert_placement_snapshot_written = True
 
     def _init_hbm_trace(self) -> None:
         self._hbm_trace_writer: HBMTraceWriter | None = None

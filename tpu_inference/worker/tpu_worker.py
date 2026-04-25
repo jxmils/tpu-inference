@@ -129,8 +129,8 @@ class TPUWorker(WorkerBase):
         # vLLM exposes this as profiler="torch" + torch_profiler_dir, but on TPU
         # start_profile/stop_profile drive jax.profiler.start_trace/stop_trace,
         # which writes XPlane-compatible traces (TensorBoard / XProf / Perfetto).
-        # Those traces include on-device collectives on the TPU ICI, including
-        # tensor-parallel all-reduce and MoE expert-parallel all-to-all.
+        # Device tracks show XLA execution; ICI-using collectives are part of that
+        # time (names are op-level, not a dedicated ICI hardware view).
         if profiler_config.profiler == "torch" and self.rank < 1 and self.pp_config.pp_world_size == 1:
             if not self.devices or 0 in self.device_ranks:
                 # For TPU, we can only have 1 active profiler session for 1 profiler
@@ -427,8 +427,9 @@ class TPUWorker(WorkerBase):
                 profile_prefix: str | None = None):
         """Start or stop a JAX profiler trace (XPlane / TensorBoard plugin).
 
-        On TPU this is the supported way to see when all-reduce (TP) and
-        all-to-all (MoE EP) run on the ICI. Requires ``profiler_config.profiler ==
+        On TPU this captures JAX/XLA device traces where TP all-reduce and MoE
+        EP all-to-all (if present) contribute to on-device spans; they are not
+        always labeled literally in Chrome JSON. Requires ``profiler_config.profiler ==
         "torch"`` and ``torch_profiler_dir`` so ``self.profile_dir`` is set
         (see ``examples/tpu_profiling.py``).
         """
