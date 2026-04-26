@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Build ShareGPT prompt-length buckets for serving experiments.
 
-Creates JSON files with prompts whose tokenized input length is near target
-bucket centers (default: 128, 256, 512, 1024, 2048, 4096).
+Creates prompt-length buckets whose tokenized input length is near target
+centers (default: 128, 256, 512, 1024, 2048, 4096).
+
+By default writes both:
+  - ``sharegpt_sp{N}.json`` (array format)
+  - ``sharegpt_sp{N}.jsonl`` (vLLM ``--dataset-name custom`` compatible)
 
 Example:
   python3 tpu_inference/datasets/build_sharegpt_length_buckets.py \
     --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
     --out-dir tpu_inference/datasets/sharegpt_buckets \
-    --max-per-bucket 1000
+    --max-per-bucket 1000 \
+    --custom-output-len 256
 """
 
 from __future__ import annotations
@@ -108,9 +113,32 @@ def main() -> int:
         "--out-dir",
         type=Path,
         default=Path("tpu_inference/datasets/sharegpt_buckets"),
-        help="Output directory for generated JSON files.",
+        help="Output directory for generated bucket files.",
+    )
+    parser.add_argument(
+        "--write-json",
+        action="store_true",
+        help="Also write array-style .json bucket files.",
+    )
+    parser.add_argument(
+        "--write-jsonl",
+        action="store_true",
+        help="Also write custom-bench compatible .jsonl bucket files.",
+    )
+    parser.add_argument(
+        "--custom-output-len",
+        type=int,
+        default=256,
+        help="output_tokens value to include in JSONL rows (default: 256).",
     )
     args = parser.parse_args()
+
+    write_json = args.write_json
+    write_jsonl = args.write_jsonl
+    # Default: write both formats for convenience.
+    if not write_json and not write_jsonl:
+        write_json = True
+        write_jsonl = True
 
     targets = [int(x.strip()) for x in args.targets.split(",") if x.strip()]
     specs = _bucket_specs(targets, args.tolerance_pct)
@@ -153,10 +181,35 @@ def main() -> int:
         rows = selected[t]
         rng.shuffle(rows)
         rows = rows[: args.max_per_bucket]
-        out_path = out_dir / f"sharegpt_sp{t}.json"
-        with out_path.open("w", encoding="utf-8") as f:
-            json.dump(rows, f, ensure_ascii=False)
-        print(f"wrote {out_path} rows={len(rows)}")
+        if write_json:
+            out_path = out_dir / f"sharegpt_sp{t}.json"
+            with out_path.open("w", encoding="utf-8") as f:
+                json.dump(rows, f, ensure_ascii=False)
+            print(f"wrote {out_path} rows={len(rows)}")
+
+        if write_jsonl:
+            out_jsonl = out_dir / f"sharegpt_sp{t}.jsonl"
+            with out_jsonl.open("w", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(
+                        json.dumps(
+                            {
+                                "prompt": r["prompt"],
+                                "output_tokens": int(args.custom_output_len),
+                                "metadata": {
+                                    "prompt_tokens": int(r["prompt_tokens"]),
+                                    "target_bucket": int(r["target_bucket"]),
+                                    "bucket_lower": int(r["bucket_lower"]),
+                                    "bucket_upper": int(r["bucket_upper"]),
+                                },
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            print(
+                f"wrote {out_jsonl} rows={len(rows)} output_tokens={args.custom_output_len}"
+            )
 
     manifest = {
         "dataset_name": args.dataset_name,
@@ -166,7 +219,10 @@ def main() -> int:
         "tolerance_pct": args.tolerance_pct,
         "max_source_rows": args.max_source_rows,
         "max_per_bucket": args.max_per_bucket,
+        "custom_output_len": int(args.custom_output_len),
         "seed": args.seed,
+        "write_json": bool(write_json),
+        "write_jsonl": bool(write_jsonl),
         "counts": {str(k): len(v) for k, v in selected.items()},
     }
     manifest_path = out_dir / "manifest.json"
