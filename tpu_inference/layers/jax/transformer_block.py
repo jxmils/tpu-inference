@@ -23,6 +23,7 @@ from tpu_inference.layers.jax.attention.attention import (AttentionMetadata,
                                                           KVCache)
 from tpu_inference.layers.jax.layers import DenseFFW
 from tpu_inference.layers.jax.moe.moe import JaxMoE
+from tpu_inference.profiler_trace import tpu_trace_region
 
 
 @dataclass(kw_only=True)
@@ -45,17 +46,23 @@ class TransformerBlock(nnx.Module):
     ) -> Tuple[KVCache, jax.Array]:
         # Attn Block
         attn_residual_TD = x_TD
-        x_TD = self.pre_attention_norm(x_TD)
-        new_cache, attn_output_TD = self.attn(x_TD, is_prefill, kv_cache,
-                                              attention_metadata,
-                                              self.use_attention_rope)
-        attn_output_TD += attn_residual_TD
+        with tpu_trace_region("norm_pre_attn"):
+            x_TD = self.pre_attention_norm(x_TD)
+        with tpu_trace_region("attention"):
+            new_cache, attn_output_TD = self.attn(x_TD, is_prefill, kv_cache,
+                                                  attention_metadata,
+                                                  self.use_attention_rope)
+        with tpu_trace_region("add_post_attn"):
+            attn_output_TD += attn_residual_TD
 
         # FFW Block
         ffw_residual_TD = attn_output_TD
-        normed_ffw_input_TD = self.pre_mlp_norm(attn_output_TD)
-        logits_TD = self.custom_module(normed_ffw_input_TD)
-        logits_TD += ffw_residual_TD
+        with tpu_trace_region("norm_pre_mlp"):
+            normed_ffw_input_TD = self.pre_mlp_norm(attn_output_TD)
+        with tpu_trace_region("mlp"):
+            logits_TD = self.custom_module(normed_ffw_input_TD)
+        with tpu_trace_region("add_post_mlp"):
+            logits_TD += ffw_residual_TD
         return new_cache, logits_TD
 
 
@@ -85,15 +92,19 @@ class SharedExpertsTransformerBlock(TransformerBlock):
     def __call__(self, x_TD, is_prefill, kv_cache, attention_metadata):
         # Attn Block
         attn_residual_TD = x_TD
-        x_TD = self.pre_attention_norm(x_TD)
-        new_cache, attn_output_TD = self.attn(x_TD, is_prefill, kv_cache,
-                                              attention_metadata,
-                                              self.use_attention_rope)
-        attn_output_TD += attn_residual_TD
+        with tpu_trace_region("norm_pre_attn"):
+            x_TD = self.pre_attention_norm(x_TD)
+        with tpu_trace_region("attention"):
+            new_cache, attn_output_TD = self.attn(x_TD, is_prefill, kv_cache,
+                                                  attention_metadata,
+                                                  self.use_attention_rope)
+        with tpu_trace_region("add_post_attn"):
+            attn_output_TD += attn_residual_TD
 
         # FFW Block
         ffw_residual_TD = attn_output_TD
-        normed_ffw_input_TD = self.pre_mlp_norm(attn_output_TD)
+        with tpu_trace_region("norm_pre_mlp"):
+            normed_ffw_input_TD = self.pre_mlp_norm(attn_output_TD)
 
         if isinstance(self.custom_module, JaxMoE):
             moe_layer = self.custom_module
@@ -106,16 +117,21 @@ class SharedExpertsTransformerBlock(TransformerBlock):
             dense_layer = self.dense_ffw
 
         if moe_layer is not None:
-            logits_TD = moe_layer(normed_ffw_input_TD)
+            with tpu_trace_region("mlp_moe"):
+                logits_TD = moe_layer(normed_ffw_input_TD)
             # Add the shared expert outputs to the MoE outputs.
-            shared_expert_output_TD = self.shared_experts(normed_ffw_input_TD)
-            logits_TD += shared_expert_output_TD
+            with tpu_trace_region("shared_experts"):
+                shared_expert_output_TD = self.shared_experts(normed_ffw_input_TD)
+            with tpu_trace_region("add_shared_experts_residual"):
+                logits_TD += shared_expert_output_TD
         elif dense_layer is not None:
-            logits_TD = dense_layer(normed_ffw_input_TD)
+            with tpu_trace_region("mlp_dense"):
+                logits_TD = dense_layer(normed_ffw_input_TD)
         else:
             raise ValueError(
                 "Neither custom_module, moe_ffw nor dense_ffw attribute is set for this SharedExpertsTransformerBlock!"
             )
 
-        logits_TD += ffw_residual_TD
+        with tpu_trace_region("add_post_mlp"):
+            logits_TD += ffw_residual_TD
         return new_cache, logits_TD

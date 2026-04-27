@@ -13,6 +13,10 @@ Includes paper-style figures:
   (c) Optional EP shard×shard heatmaps from layer_*_ep_ragged_a2a_* keys when
       inference sets CAPTURE_MOE_EP_RAGGED_A2A=1 (Megablox send_sizes schedule).
   (d) Multi-page PDF: per-layer bar histogram of expert load (summed expert_count).
+Bundle extras (Chrome trace): heuristic stacked breakdown (attention/gate/collective/
+experts/add_norm/other), collective ops CSV + histogram, traffic-style heatmaps
+(white→green→dark blue). Also: phase row counts, routing totals (B), tokens vs comm,
+comm vs dispatch pie, expert_placement_map table.
 
 Usage:
   python plot_raw_traces.py
@@ -51,6 +55,7 @@ import numpy as np
 import pandas as pd
 
 import plot_bundle_extras as _bundle
+from perfetto_op_breakdown import traffic_heatmap_colormap
 
 
 def _repo_root() -> Path:
@@ -1854,7 +1859,12 @@ def _heatmap_layer_expert(
     if pivot.size == 0:
         return None
     fig, ax = plt.subplots(figsize=(14, max(4, 0.35 * len(pivot.index))))
-    im = ax.imshow(pivot.to_numpy(), aspect="auto", interpolation="nearest")
+    im = ax.imshow(
+        pivot.to_numpy(),
+        aspect="auto",
+        interpolation="nearest",
+        cmap=traffic_heatmap_colormap(),
+    )
     ax.set_title(title)
     ax.set_ylabel("layer_idx")
     ax.set_xlabel("expert_id")
@@ -2269,7 +2279,14 @@ def plot_paper_style_expert_pair_heatmaps(
 
     fig, axes = plt.subplots(1, 4, figsize=(16, 4), constrained_layout=True)
     for ax, st, mat in zip(axes, pick_steps, cropped):
-        im = ax.imshow(mat, aspect="equal", interpolation="nearest", vmin=0.0, vmax=vmax)
+        im = ax.imshow(
+            mat,
+            aspect="equal",
+            interpolation="nearest",
+            vmin=0.0,
+            vmax=vmax,
+            cmap=traffic_heatmap_colormap(),
+        )
         ax.set_title(f"step {st}")
         ax.set_xlabel("expert j")
         ax.set_ylabel("expert i")
@@ -2292,7 +2309,12 @@ def plot_paper_style_expert_pair_heatmaps(
     normed = [_row_normalize_2d(m) for m in cropped]
     for ax, st, mat_n in zip(axes_n, pick_steps, normed):
         im_n = ax.imshow(
-            mat_n, aspect="equal", interpolation="nearest", vmin=0.0, vmax=1.0
+            mat_n,
+            aspect="equal",
+            interpolation="nearest",
+            vmin=0.0,
+            vmax=1.0,
+            cmap=traffic_heatmap_colormap(),
         )
         ax.set_title(f"step {st} (row-norm)")
         ax.set_xlabel("expert j")
@@ -2315,7 +2337,14 @@ def plot_paper_style_expert_pair_heatmaps(
     if sym_max <= 0:
         sym_max = 1.0
     for ax, st, sym in zip(axes2, pick_steps, syms):
-        im2 = ax.imshow(sym, aspect="equal", interpolation="nearest", vmin=0.0, vmax=sym_max)
+        im2 = ax.imshow(
+            sym,
+            aspect="equal",
+            interpolation="nearest",
+            vmin=0.0,
+            vmax=sym_max,
+            cmap=traffic_heatmap_colormap(),
+        )
         ax.set_title(f"step {st} (sym)")
         ax.set_xlabel("expert j")
         ax.set_ylabel("expert i")
@@ -2393,7 +2422,9 @@ def plot_ep_ragged_a2a_heatmaps(traces_dir: Path, out_dir: Path) -> list[Path]:
             ncols = 2 if r is not None else 1
             fig, axes = plt.subplots(1, ncols, figsize=(5.2 * ncols, 4.2))
             ax_list = np.atleast_1d(axes)
-            im0 = ax_list[0].imshow(d, aspect="auto", interpolation="nearest")
+            im0 = ax_list[0].imshow(
+                d, aspect="auto", interpolation="nearest", cmap=traffic_heatmap_colormap()
+            )
             ax_list[0].set_title(
                 "dispatch bytes\n(send_sizes × hidden × dtype; not NIC)"
             )
@@ -2401,7 +2432,9 @@ def plot_ep_ragged_a2a_heatmaps(traces_dir: Path, out_dir: Path) -> list[Path]:
             ax_list[0].set_ylabel("src expert shard")
             fig.colorbar(im0, ax=ax_list[0], fraction=0.046, pad=0.04)
             if r is not None and ncols == 2:
-                im1 = ax_list[1].imshow(r, aspect="auto", interpolation="nearest")
+                im1 = ax_list[1].imshow(
+                    r, aspect="auto", interpolation="nearest", cmap=traffic_heatmap_colormap()
+                )
                 ax_list[1].set_title("return bytes")
                 ax_list[1].set_xlabel("dst expert shard")
                 ax_list[1].set_ylabel("src expert shard")
@@ -2415,13 +2448,27 @@ def plot_ep_ragged_a2a_heatmaps(traces_dir: Path, out_dir: Path) -> list[Path]:
             r_norm = _row_normalize_2d(r) if r is not None else None
             fig_n, axes_n = plt.subplots(1, ncols, figsize=(5.2 * ncols, 4.2))
             axn = np.atleast_1d(axes_n)
-            imn0 = axn[0].imshow(d_norm, aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0)
+            imn0 = axn[0].imshow(
+                d_norm,
+                aspect="auto",
+                interpolation="nearest",
+                vmin=0.0,
+                vmax=1.0,
+                cmap=traffic_heatmap_colormap(),
+            )
             axn[0].set_title("dispatch share (row-normalized)")
             axn[0].set_xlabel("dst expert shard")
             axn[0].set_ylabel("src expert shard")
             fig_n.colorbar(imn0, ax=axn[0], fraction=0.046, pad=0.04)
             if r_norm is not None and ncols == 2:
-                imn1 = axn[1].imshow(r_norm, aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0)
+                imn1 = axn[1].imshow(
+                    r_norm,
+                    aspect="auto",
+                    interpolation="nearest",
+                    vmin=0.0,
+                    vmax=1.0,
+                    cmap=traffic_heatmap_colormap(),
+                )
                 axn[1].set_title("return share (row-normalized)")
                 axn[1].set_xlabel("dst expert shard")
                 axn[1].set_ylabel("src expert shard")
@@ -2430,6 +2477,245 @@ def plot_ep_ragged_a2a_heatmaps(traces_dir: Path, out_dir: Path) -> list[Path]:
             fig_n.tight_layout()
             saved.append(
                 _save(fig_n, out_dir, f"ep_ragged_a2a_norm_{stem}_layer{lid}"))
+    return saved
+
+
+def plot_phase_row_frequency(
+    agg: RoutingStreamAgg, out_dir: Path, prefix: str = "routing"
+) -> list[Path]:
+    """Bar chart: routing-summary row counts by phase (prefill / decode / mixed)."""
+    saved: list[Path] = []
+    prc = getattr(agg, "_phase_row_count", None)
+    if not prc:
+        return saved
+    labels = [str(k) for k in sorted(prc.keys())]
+    vals = [int(prc[k]) for k in sorted(prc.keys())]
+    if sum(vals) <= 0:
+        return saved
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(labels, vals, color="tab:cyan", alpha=0.88, width=0.55)
+    ax.set_title("Routing-summary row frequency by phase (streamed)")
+    ax.set_ylabel("row count")
+    ax.grid(True, alpha=0.28, axis="y")
+    saved.append(_save(fig, out_dir, f"{prefix}_phase_row_frequency"))
+    return saved
+
+
+def plot_routing_totals_dispatch_return_b(
+    agg: RoutingStreamAgg, out_dir: Path, prefix: str = "routing"
+) -> list[Path]:
+    """Total estimated routing traffic (dispatch vs return) in billions of bytes."""
+    saved: list[Path] = []
+    dtot = float(sum(agg._phase_dispatch_sum.values()))
+    rtot = float(sum(agg._phase_return_sum.values()))
+    if dtot + rtot <= 0:
+        return saved
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    ax.bar(
+        ["estimated_dispatch (B)", "estimated_return (B)"],
+        [dtot / 1e9, rtot / 1e9],
+        color=("steelblue", "coral"),
+        alpha=0.9,
+        width=0.5,
+    )
+    ax.set_ylabel("bytes (billions)")
+    ax.set_title("Total MoE routing traffic (aggregate over loaded summaries)")
+    ax.grid(True, alpha=0.28, axis="y")
+    saved.append(_save(fig, out_dir, f"{prefix}_total_dispatch_return_billion"))
+    return saved
+
+
+def plot_step_tokens_vs_comm_proxy(
+    step: pd.DataFrame, out_dir: Path, prefix: str = "step"
+) -> list[Path]:
+    """Comm proxy vs scheduled tokens per step (sequence-length / load proxy)."""
+    saved: list[Path] = []
+    if step.empty or "trace_step" not in step.columns:
+        return saved
+    if "num_tokens" not in step.columns or "comm_bytes_proxy_total" not in step.columns:
+        return saved
+    x = pd.to_numeric(step["trace_step"], errors="coerce")
+    nt = pd.to_numeric(step["num_tokens"], errors="coerce")
+    comm = pd.to_numeric(step["comm_bytes_proxy_total"], errors="coerce")
+    m = x.notna() & nt.notna() & comm.notna()
+    if m.sum() < 2:
+        return saved
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    sc = ax.scatter(
+        nt[m],
+        comm[m] / 1e9,
+        c=x[m],
+        cmap="viridis",
+        alpha=0.65,
+        s=22,
+    )
+    ax.set_xlabel("num_tokens (scheduled)")
+    ax.set_ylabel("comm_bytes_proxy_total (GB)")
+    ax.set_title("Communication proxy vs batch tokens (color = trace_step)")
+    ax.grid(True, alpha=0.28)
+    plt.colorbar(sc, ax=ax, label="trace_step")
+    saved.append(_save(fig, out_dir, f"{prefix}_tokens_vs_comm_proxy_scatter"))
+    return saved
+
+
+def plot_comm_vs_moe_bytes_share_pie(
+    step: pd.DataFrame, out_dir: Path, prefix: str = "step"
+) -> list[Path]:
+    """Mean comm proxy vs mean MoE dispatch total (traffic mix, step_summary)."""
+    saved: list[Path] = []
+    if step.empty:
+        return saved
+    if "comm_bytes_proxy_total" not in step.columns:
+        return saved
+    if "estimated_dispatch_bytes_total" not in step.columns:
+        return saved
+    comm = pd.to_numeric(step["comm_bytes_proxy_total"], errors="coerce")
+    disp = pd.to_numeric(step["estimated_dispatch_bytes_total"], errors="coerce")
+    if not comm.notna().any() or not disp.notna().any():
+        return saved
+    c_mean = float(comm.mean())
+    d_mean = float(disp.mean())
+    tot = c_mean + d_mean
+    if tot <= 0:
+        return saved
+    fig, ax = plt.subplots(figsize=(5.2, 5.2))
+    ax.pie(
+        [c_mean, d_mean],
+        labels=[
+            f"comm_bytes_proxy\n({c_mean/1e9:.3f} GB · mean/step)",
+            f"estimated_dispatch_total\n({d_mean/1e9:.3f} GB · mean/step)",
+        ],
+        autopct="%1.1f%%",
+        startangle=90,
+        colors=["#ff7f0e", "#2ca02c"],
+    )
+    ax.set_title("Mean traffic mix (comm proxy vs MoE dispatch estimate)")
+    saved.append(_save(fig, out_dir, f"{prefix}_comm_vs_dispatch_share_pie"))
+    return saved
+
+
+def plot_expert_placement_snapshot(
+    traces_dir: Path, out_dir: Path, prefix: str = "placement"
+) -> list[Path]:
+    """Table: TPU device / mesh coords → expert shard range (from expert_placement_map)."""
+    saved: list[Path] = []
+    paths = sorted(traces_dir.glob("request/expert_placement*.jsonl"))
+    if not paths:
+        return saved
+    placement_row: dict[str, Any] | None = None
+    for p in reversed(paths):
+        try:
+            for row in _iter_jsonl(p):
+                if row.get("record_type") == "expert_placement_map":
+                    placement_row = row
+                    break
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if placement_row is not None:
+            break
+    if not placement_row:
+        return saved
+    placements = placement_row.get("placements")
+    if not isinstance(placements, list) or not placements:
+        return saved
+    rows: list[list[str]] = []
+    for pl in placements:
+        if not isinstance(pl, dict):
+            continue
+        coords = pl.get("coords")
+        coord_s = json.dumps(coords, sort_keys=True) if coords is not None else ""
+        rows.append(
+            [
+                str(pl.get("flat_device_index", "")),
+                str(pl.get("device_id", "")),
+                coord_s[:48],
+                str(pl.get("expert_shard_index", "")),
+                str(pl.get("expert_range_start", "")),
+                str(pl.get("expert_range_end_exclusive", "")),
+            ]
+        )
+    if not rows:
+        return saved
+    fig, ax = plt.subplots(
+        figsize=(14, max(3.0, 0.22 * len(rows) + 1.5)),
+        constrained_layout=True,
+    )
+    ax.axis("off")
+    col_labels = [
+        "flat_idx",
+        "device_id",
+        "coords",
+        "expert_shard",
+        "expert_start",
+        "expert_end_exc",
+    ]
+    tbl = ax.table(
+        cellText=rows,
+        colLabels=col_labels,
+        loc="center",
+        cellLoc="left",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7)
+    tbl.scale(1.0, 1.15)
+    title = (
+        f"Expert placement (TPU devices)  model={placement_row.get('model', '')}  "
+        f"tp={placement_row.get('tp_size')}  ep={placement_row.get('ep_size')}  "
+        f"experts={placement_row.get('total_experts')}"
+    )
+    ax.set_title(title, fontsize=9)
+    saved.append(_save(fig, out_dir, f"{prefix}_expert_device_map"))
+    return saved
+
+
+def plot_phase_row_frequency_from_df(
+    routing: pd.DataFrame, out_dir: Path, prefix: str = "routing_full"
+) -> list[Path]:
+    """Bar chart of routing-summary row counts by phase (full dataframe load)."""
+    saved: list[Path] = []
+    if routing.empty or "phase" not in routing.columns:
+        return saved
+    vc = routing["phase"].astype(str).value_counts()
+    if vc.sum() <= 0:
+        return saved
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(vc.index.astype(str), vc.to_numpy(), color="tab:cyan", alpha=0.88, width=0.55)
+    ax.set_title("Routing-summary row frequency by phase (full load)")
+    ax.set_ylabel("row count")
+    ax.grid(True, alpha=0.28, axis="y")
+    saved.append(_save(fig, out_dir, f"{prefix}_phase_row_frequency"))
+    return saved
+
+
+def plot_routing_totals_dispatch_return_from_df(
+    routing: pd.DataFrame, out_dir: Path, prefix: str = "routing_full"
+) -> list[Path]:
+    """Total dispatch + return routing bytes (billions) from a full routing dataframe."""
+    saved: list[Path] = []
+    if routing.empty or "estimated_dispatch_bytes" not in routing.columns:
+        return saved
+    dtot = float(
+        pd.to_numeric(routing["estimated_dispatch_bytes"], errors="coerce").fillna(0).sum()
+    )
+    rtot = 0.0
+    if "estimated_return_bytes" in routing.columns:
+        rtot = float(
+            pd.to_numeric(routing["estimated_return_bytes"], errors="coerce").fillna(0).sum()
+        )
+    if dtot + rtot <= 0:
+        return saved
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    ax.bar(
+        ["estimated_dispatch (B)", "estimated_return (B)"],
+        [dtot / 1e9, rtot / 1e9],
+        color=("steelblue", "coral"),
+        alpha=0.9,
+        width=0.5,
+    )
+    ax.set_ylabel("bytes (billions)")
+    ax.set_title("Total MoE routing traffic (full routing_summary load)")
+    ax.grid(True, alpha=0.28, axis="y")
+    saved.append(_save(fig, out_dir, f"{prefix}_total_dispatch_return_billion"))
     return saved
 
 
@@ -2544,6 +2830,8 @@ def main() -> int:
     all_saved: list[Path] = []
     all_saved.extend(plot_step_series(step, out_dir))
     all_saved.extend(plot_hbm(hbm, out_dir))
+    all_saved.extend(plot_step_tokens_vs_comm_proxy(step, out_dir))
+    all_saved.extend(plot_comm_vs_moe_bytes_share_pie(step, out_dir))
 
     if not args.skip_bundle_extras:
         bundle: Path | None = None
@@ -2560,6 +2848,7 @@ def main() -> int:
             if tp is not None:
                 print(f"  profile trace: {tp}")
                 all_saved.extend(_bundle.plot_perfetto_comm_compute(tp, out_dir))
+                all_saved.extend(_bundle.plot_perfetto_execute_model_breakdown(tp, out_dir))
             if has_hlo:
                 all_saved.extend(
                     _bundle.plot_hlo_module_families(
@@ -2643,6 +2932,8 @@ def main() -> int:
                 )
             )
         all_saved.extend(plot_step_vs_routing(step, routing, out_dir))
+        all_saved.extend(plot_phase_row_frequency_from_df(routing, out_dir))
+        all_saved.extend(plot_routing_totals_dispatch_return_from_df(routing, out_dir))
         if not args.skip_ep_ragged_a2a:
             all_saved.extend(plot_ep_ragged_a2a_heatmaps(traces_dir, out_dir))
     else:
@@ -2674,8 +2965,12 @@ def main() -> int:
                 )
             )
         all_saved.extend(plot_step_vs_routing_agg(step, agg, out_dir))
+        all_saved.extend(plot_phase_row_frequency(agg, out_dir))
+        all_saved.extend(plot_routing_totals_dispatch_return_b(agg, out_dir))
         if not args.skip_ep_ragged_a2a:
             all_saved.extend(plot_ep_ragged_a2a_heatmaps(traces_dir, out_dir))
+
+    all_saved.extend(plot_expert_placement_snapshot(traces_dir, out_dir))
 
     print(f"Wrote {len(all_saved)} PDFs under {out_dir}")
     for p in sorted(all_saved)[:30]:

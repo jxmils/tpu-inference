@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 from tpu_inference.kernels.fused_moe.v1.kernel import fused_ep_moe
 from tpu_inference.layers.common.fused_moe_gmm import fused_moe_func
 from tpu_inference.logger import init_logger
+from tpu_inference.profiler_trace import tpu_trace_region
 
 if TYPE_CHECKING:
     from tpu_inference.layers.common.process_weights.moe_weights import (
@@ -104,41 +105,43 @@ def moe_apply(
                 actual_hidden_size = x.shape[-1]
                 padding_size = weights.w13_weight.shape[-2] - actual_hidden_size
                 x = jnp.pad(x, ((0, 0), (0, padding_size)))
-                output = fused_ep_moe(
-                    mesh=mesh,
-                    tokens=x,
-                    w1=weights.w13_weight,
-                    w2=weights.w2_weight,
-                    gating_output=gating_output,
-                    top_k=layer.top_k,
-                    renormalize_topk_logits=layer.renormalize,
-                    act_fn=activation,
-                    scoring_fn=layer.scoring_func,
-                    subc_quant_w1_sz=subc_quant_w1_sz,
-                    subc_quant_w2_sz=subc_quant_w2_sz,
-                    w1_scale=weights.w13_weight_scale,
-                    w2_scale=weights.w2_weight_scale,
-                    b1=weights.w13_bias,
-                    b2=weights.w2_bias,
-                    **extra_backend_kwargs,
-                )[:, :actual_hidden_size]
+                with tpu_trace_region("moe_fused_ep"):
+                    output = fused_ep_moe(
+                        mesh=mesh,
+                        tokens=x,
+                        w1=weights.w13_weight,
+                        w2=weights.w2_weight,
+                        gating_output=gating_output,
+                        top_k=layer.top_k,
+                        renormalize_topk_logits=layer.renormalize,
+                        act_fn=activation,
+                        scoring_fn=layer.scoring_func,
+                        subc_quant_w1_sz=subc_quant_w1_sz,
+                        subc_quant_w2_sz=subc_quant_w2_sz,
+                        w1_scale=weights.w13_weight_scale,
+                        w2_scale=weights.w2_weight_scale,
+                        b1=weights.w13_bias,
+                        b2=weights.w2_bias,
+                        **extra_backend_kwargs,
+                    )[:, :actual_hidden_size]
             case MoEBackend.GMM_EP | MoEBackend.GMM_TP:
-                output = fused_moe_func(
-                    hidden_states=x,
-                    w1=weights.w13_weight,
-                    w2=weights.w2_weight,
-                    w1_scale=weights.w13_weight_scale,
-                    w2_scale=weights.w2_weight_scale,
-                    w1_bias=weights.w13_bias,
-                    w2_bias=weights.w2_bias,
-                    gating_output=gating_output,
-                    topk=layer.top_k,
-                    renormalize=layer.renormalize,
-                    mesh=mesh,
-                    use_ep=layer.use_ep,
-                    activation=activation,
-                    scoring_fn=layer.scoring_func,
-                )
+                with tpu_trace_region("moe_gmm"):
+                    output = fused_moe_func(
+                        hidden_states=x,
+                        w1=weights.w13_weight,
+                        w2=weights.w2_weight,
+                        w1_scale=weights.w13_weight_scale,
+                        w2_scale=weights.w2_weight_scale,
+                        w1_bias=weights.w13_bias,
+                        w2_bias=weights.w2_bias,
+                        gating_output=gating_output,
+                        topk=layer.top_k,
+                        renormalize=layer.renormalize,
+                        mesh=mesh,
+                        use_ep=layer.use_ep,
+                        activation=activation,
+                        scoring_fn=layer.scoring_func,
+                    )
             case MoEBackend.DENSE_MAT:
                 # NOTE: circular import avoidance
                 from tpu_inference.layers.jax.moe.dense_moe import \
@@ -149,18 +152,19 @@ def moe_apply(
                 assert len(
                     gating_output
                 ) == 2, "Expected the gating output to be have 2 entries: weights and indices"
-                return dense_moe_func(
-                    weights=weights,
-                    x_TD=x,
-                    gating_output=gating_output,
-                    cast_dtype=layer.dtype,
-                    num_local_experts=layer.num_local_experts,
-                    apply_expert_weight_before_computation=layer.
-                    apply_expert_weight_before_computation,
-                    activation_ffw_ted=layer.activation_ffw_ted,
-                    activation_ffw_td=layer.activation_ffw_td,
-                    hidden_act=layer.hidden_act,
-                    mesh=mesh)
+                with tpu_trace_region("moe_dense_mat"):
+                    return dense_moe_func(
+                        weights=weights,
+                        x_TD=x,
+                        gating_output=gating_output,
+                        cast_dtype=layer.dtype,
+                        num_local_experts=layer.num_local_experts,
+                        apply_expert_weight_before_computation=layer.
+                        apply_expert_weight_before_computation,
+                        activation_ffw_ted=layer.activation_ffw_ted,
+                        activation_ffw_td=layer.activation_ffw_td,
+                        hidden_act=layer.hidden_act,
+                        mesh=mesh)
 
             case MoEBackend.MEGABLX_GMM:
                 # NOTE: circular import avoidance

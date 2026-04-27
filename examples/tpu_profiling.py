@@ -10,6 +10,9 @@
 # NOTE: you will need the tensorboard-plugin-profile python package to
 # visualize the results in TensorBoard.
 # Please see docs/profiling.md for more details.
+# Opaque fused comm slices in Perfetto (e.g. $<unknown> reduce): see
+# DISABLE_TPU_COLLECTIVE_MATMUL_FUSION in docs/profiling.md when using the
+# tpu-inference TPU runner / VllmModelWrapper path.
 #
 # If you see "unrecognized arguments: --profile-scenario", this file on the VM
 # is stale — run `git pull` in the repo (or use the explicit --input-len lines).

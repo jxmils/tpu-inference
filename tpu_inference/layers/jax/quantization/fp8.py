@@ -26,6 +26,7 @@ from torchax.ops.mappings import t2j
 
 from tpu_inference.layers.common.linear import sharded_quantized_batched_matmul
 from tpu_inference.layers.common.moe import MoEBackend, moe_apply
+from tpu_inference.profiler_trace import tpu_trace_region
 from tpu_inference.layers.common.process_weights.linear_weights import \
     shard_linear_weights
 from tpu_inference.layers.common.process_weights.moe_weights import (
@@ -581,7 +582,14 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
 
         return True
 
-    def apply_jax(self, layer: JaxModule, x: jax.Array) -> jax.Array:
+    def apply_jax(
+        self,
+        layer: JaxModule,
+        x: jax.Array,
+        *,
+        capture_routing_stats: bool = False,
+        layer_idx: int | None = None,
+    ) -> jax.Array:
         """
         Run the forward pass of the MoE layer.
 
@@ -605,7 +613,8 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
         # Fused weight backends
         if layer.moe_backend in FP8_QUANT_METHOD_SUPPORTED_MOE_BACKENDS:
             # of shape TE -- we don't return the indices
-            router_logits = layer.router(x_TD)
+            with tpu_trace_region("gate"):
+                router_logits = layer.router(x_TD)
 
             if layer.moe_backend == MoEBackend.FUSED_MOE:
                 w13_weight = layer.kernel_gating_upproj_E2DF[...]
@@ -654,9 +663,10 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                 in (MoEBackend.GMM_EP, MoEBackend.GMM_TP),
             )
 
-        output = moe_apply(layer, x_TD, router_logits, weights,
-                           layer.moe_backend, layer.mesh,
-                           self.extra_backend_kwargs)
+        with tpu_trace_region("moe_kernel"):
+            output = moe_apply(layer, x_TD, router_logits, weights,
+                               layer.moe_backend, layer.mesh,
+                               self.extra_backend_kwargs)
         if capture_routing_stats:
             return output, routing_stats
         return output

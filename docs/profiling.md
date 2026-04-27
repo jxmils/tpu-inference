@@ -188,6 +188,10 @@ In order to use this approach, you can do the following:
 - `vllm:compute_logits` — LM head / logits after hidden states.
 - `vllm:mm_encoder` — multimodal encoder path only.
 
+**First-class layer scopes (`tpu_trace:*`):** the JAX forward also emits `jax.profiler.TraceAnnotation` regions via `tpu_inference.profiler_trace.tpu_trace_region` (for example `tpu_trace:attention`, `tpu_trace:gate`, `tpu_trace:moe_experts`, `tpu_trace:moe_all2all_dispatch`). `trace_plotter/perfetto_op_breakdown.py` prefers these names over kernel-string heuristics when building stacked breakdown plots. Disable all such regions with `DISABLE_TPU_TRACE_ANNOTATIONS=1`.
+
+**Fused collective + matmul (XLA):** the TPU runner’s main `jax.jit` step in `VllmModelWrapper` sets `compiler_options` with `xla_tpu_all_gather_collective_matmul_mode` and `xla_tpu_reduce_scatter_collective_matmul_mode` both to `post_spmd_conservative`. That fusion is good for performance but Chrome / Perfetto exports often show the fused region as opaque names such as `$<unknown> reduce` instead of separate dot and collective slices. For debugging or apples-to-apples comparison with a minimal JAX workload, set **`DISABLE_TPU_COLLECTIVE_MATMUL_FUSION=1`** before process start so those options are omitted (expect a **recompile** and different performance).
+
 In XProf, collective ops (all-reduce, all-to-all, reduce-scatter, etc.) are **communication**; matmuls, activations, softmax, etc. are **compute**. **Overlap** appears when the critical path is shorter than the sum of isolated collective durations—use the trace critical path, not summed kernel labels alone.
 
 **Host wall splits (approximate):** `step/step_trace_*.jsonl` `step_summary` records include `model_forward_wall_time_s` and `compute_logits_wall_time_s` (body vs logits head only; they do **not** split MoE matmul vs MoE all-to-all).

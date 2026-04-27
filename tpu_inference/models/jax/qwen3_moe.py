@@ -36,6 +36,7 @@ from transformers import Qwen3Config
 from vllm.config import VllmConfig
 
 from tpu_inference import envs
+from tpu_inference.profiler_trace import tpu_trace_region
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -179,11 +180,13 @@ class Qwen3MoeSparseMoeBlock(JaxModule):
                                               capture_routing_stats=True,
                                               layer_idx=layer_idx)
             if self.shared_expert is not None:
-                out += self.shared_expert(x)
+                with tpu_trace_region("shared_experts"):
+                    out += self.shared_expert(x)
             return out, routing_stats
         out = self.experts(x)
         if self.shared_expert is not None:
-            out += self.shared_expert(x)
+            with tpu_trace_region("shared_experts"):
+                out += self.shared_expert(x)
         return out
 
 
@@ -250,23 +253,30 @@ class Qwen3MoeDecoderLayer(JaxModule):
         x: jax.Array,
         attention_metadata: AttentionMetadata,
     ) -> Tuple[jax.Array, jax.Array] | Tuple[jax.Array, jax.Array, dict]:
-        hidden_states = self.input_layernorm(x)
-        kv_cache, attn_output = self.self_attn(
-            kv_cache,
-            hidden_states,
-            attention_metadata,
-        )
-        attn_output += x
+        with tpu_trace_region("norm_pre_attn"):
+            hidden_states = self.input_layernorm(x)
+        with tpu_trace_region("attention"):
+            kv_cache, attn_output = self.self_attn(
+                kv_cache,
+                hidden_states,
+                attention_metadata,
+            )
+        with tpu_trace_region("add_post_attn"):
+            attn_output += x
 
         residual = attn_output
-        attn_output = self.post_attention_layernorm(attn_output)
+        with tpu_trace_region("norm_pre_mlp"):
+            attn_output = self.post_attention_layernorm(attn_output)
         capture_routing_stats = envs.moe_routing_stats_enabled()
         if capture_routing_stats:
-            outputs, routing_stats = self.mlp(attn_output,
-                                              layer_idx=self.layer_idx)
+            with tpu_trace_region("mlp"):
+                outputs, routing_stats = self.mlp(attn_output,
+                                                  layer_idx=self.layer_idx)
         else:
-            outputs = self.mlp(attn_output)
-        outputs = residual + outputs
+            with tpu_trace_region("mlp"):
+                outputs = self.mlp(attn_output)
+        with tpu_trace_region("add_post_mlp"):
+            outputs = residual + outputs
         if capture_routing_stats:
             return kv_cache, outputs, routing_stats
         return kv_cache, outputs

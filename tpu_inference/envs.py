@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     LAYOUT_Q_PROJ_AS_NDH: bool = False
+    DISABLE_TPU_COLLECTIVE_MATMUL_FUSION: bool = False
 
 
 def env_with_choices(
@@ -323,6 +324,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # or DNH (model dim, q-heads, head dim), which is the default (False)
     "LAYOUT_Q_PROJ_AS_NDH":
     lambda: bool(int(os.getenv("LAYOUT_Q_PROJ_AS_NDH") or "0")),
+    # When true, omit xla_tpu_*_collective_matmul_mode from the main step jax.jit
+    # (see VllmModelWrapper). Traces then show separate matmul vs collective
+    # slices instead of fused kernels often labeled $<unknown> reduce in Chrome
+    # trace exports.
+    "DISABLE_TPU_COLLECTIVE_MATMUL_FUSION":
+    env_bool("DISABLE_TPU_COLLECTIVE_MATMUL_FUSION", default=False),
 }
 
 

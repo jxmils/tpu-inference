@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from perfetto_comm_compute import summarize_trace_to_dataframe
+from perfetto_op_breakdown import traffic_heatmap_colormap
 
 
 def _save(fig: matplotlib.figure.Figure, out_dir: Path, stem: str) -> Path:
@@ -250,7 +251,12 @@ def plot_ici_from_step(step: pd.DataFrame, out_dir: Path, prefix: str = "ici") -
     if pivot.shape[1] > 200:
         pivot = pivot.iloc[:, :: max(1, pivot.shape[1] // 200)]
     fig, ax = plt.subplots(figsize=(min(14, 0.06 * pivot.shape[1] + 4), min(8, 0.25 * pivot.shape[0] + 2)))
-    im = ax.imshow(pivot.to_numpy(), aspect="auto", interpolation="nearest", cmap="magma")
+    im = ax.imshow(
+        pivot.to_numpy(),
+        aspect="auto",
+        interpolation="nearest",
+        cmap=traffic_heatmap_colormap(),
+    )
     ax.set_title("ICI Δ per chip (rows) vs trace_step (columns, subsampled if long)")
     ax.set_ylabel("chip index")
     ax.set_xlabel("trace_step column index (ordered)")
@@ -338,4 +344,72 @@ def plot_benchmark_engine_utilization(
         "Note: remainder includes client queueing, scheduler, gaps between traced steps"
     )
     saved.append(_save(fig, out_dir, f"{prefix}_engine_time_vs_window"))
+    return saved
+
+
+def plot_perfetto_execute_model_breakdown(trace_path: Path, out_dir: Path, prefix: str = "profile") -> list[Path]:
+    """Stacked bars per execute_model step: attention / gate / collective / experts / add_norm / other."""
+    saved: list[Path] = []
+    try:
+        from perfetto_op_breakdown import extract_collective_ops, summarize_execute_model_breakdown
+    except ImportError:
+        return saved
+
+    df = summarize_execute_model_breakdown(trace_path)
+    if df.empty:
+        return saved
+
+    cols = [
+        ("attention_ms", "attention", "#1f77b4"),
+        ("gate_ms", "gate", "#9467bd"),
+        ("collective_ms", "collective", "#ff7f0e"),
+        ("experts_ms", "experts", "#2ca02c"),
+        ("add_norm_ms", "add_norm", "#17becf"),
+        ("other_compute_ms", "other_compute", "#bdbdbd"),
+    ]
+    x = np.arange(len(df))
+    bottoms = np.zeros(len(df))
+    fig, ax = plt.subplots(figsize=(max(10, len(df) * 0.18), 5.5))
+    for key, lab, color in cols:
+        vals = pd.to_numeric(df[key], errors="coerce").fillna(0.0).to_numpy()
+        ax.bar(x, vals, bottom=bottoms, label=lab, width=0.82, color=color)
+        bottoms += vals
+    ax.set_title(
+        "execute_model steps — heuristic compute/comm buckets (from trace names)\n"
+        f"{trace_path.name}"
+    )
+    ax.set_xlabel("execute_model index")
+    ax.set_ylabel("ms (merged within bucket; overlap can double-count)")
+    ax.legend(loc="upper right", fontsize=7, ncol=2)
+    ax.grid(True, alpha=0.22, axis="y")
+    saved.append(_save(fig, out_dir, f"{prefix}_execute_model_breakdown_stacked"))
+
+    csv_path = out_dir / f"{prefix}_execute_model_breakdown.csv"
+    df.to_csv(csv_path, index=False)
+
+    ops = extract_collective_ops(trace_path)
+    if not ops.empty:
+        ops_path = out_dir / f"{prefix}_collective_ops.csv"
+        ops.to_csv(ops_path, index=False)
+        du = pd.to_numeric(ops["duration_ms"], errors="coerce").fillna(0.0)
+        if du.sum() > 0:
+            arr = du.to_numpy(dtype=float)
+            hi = float(np.nanpercentile(arr, 99))
+            if not np.isfinite(hi) or hi <= 0:
+                hi = float(np.nanmax(arr)) if arr.size else 1.0
+            fig2, ax2 = plt.subplots(figsize=(8, 4))
+            ax2.hist(
+                np.clip(arr, 0.0, hi),
+                bins=40,
+                color="#ff7f0e",
+                edgecolor="white",
+            )
+            ax2.set_title(
+                "Collective-like op durations (histogram, clipped at 99p to limit long tails)"
+            )
+            ax2.set_xlabel("duration (ms)")
+            ax2.set_ylabel("count")
+            ax2.grid(True, alpha=0.25, axis="y")
+            saved.append(_save(fig2, out_dir, f"{prefix}_collective_duration_hist"))
+
     return saved

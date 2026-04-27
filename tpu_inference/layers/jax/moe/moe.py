@@ -177,11 +177,20 @@ class JaxMoE(JaxModule):
     quant_config: Optional[QuantizationConfig] = None
     prefix: str = ""
 
-    def __call__(self, x_TD: Float):
+    def __call__(
+        self,
+        x_TD: Float,
+        *,
+        capture_routing_stats: bool = False,
+        layer_idx: int | None = None,
+    ):
         """Performs the forward pass of the MoE layer.
 
         Args:
             x_TD: Input array of shape (sequence_length, d_model).
+            capture_routing_stats: When True, ``quant_method.apply_jax`` may return
+                ``(output, routing_stats)``.
+            layer_idx: Optional layer index for routing stats.
 
         Returns:
             Output array of shape (sequence_length, d_model) after passing

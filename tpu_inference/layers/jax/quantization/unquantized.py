@@ -20,8 +20,9 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from tpu_inference.layers.common.moe import MoEBackend, moe_apply
 from tpu_inference import envs
+from tpu_inference.layers.common.moe import MoEBackend, moe_apply
+from tpu_inference.profiler_trace import tpu_trace_region
 from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, UnfusedMoEWeights)
 from tpu_inference.layers.common.quantization import unquantized as jax_common
@@ -150,7 +151,8 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
         # Fused weight backends
         if layer.moe_backend in MoEBackend.fused_moe_backends():
             # of shape TE, only 1D in this case
-            router_logits = layer.router(x_TD)
+            with tpu_trace_region("gate"):
+                router_logits = layer.router(x_TD)
 
             w13_weight = layer.kernel_gating_upproj_E2DF.value if layer.moe_backend == MoEBackend.FUSED_MOE else layer.kernel_gating_upproj_EDF.value
             w2_weight = layer.kernel_down_proj_EFD.value
@@ -169,7 +171,8 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                 MoEBackend.DENSE_MAT, MoEBackend.MEGABLX_GMM
         ]:
             # Composed of weights_TX and indices_TX, so 2D in this case
-            router_logits = layer.router(x_TD)
+            with tpu_trace_region("gate"):
+                router_logits = layer.router(x_TD)
             # TODO (jacobplatin/bzgoogle): we should support bias
             weights = UnfusedMoEWeights(
                 w1_weight=layer.kernel_gating_EDF.value,
@@ -228,16 +231,29 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
             and layer.moe_backend == MoEBackend.MEGABLX_GMM
             and envs.moe_ep_ragged_a2a_matrix_enabled()
         )
-        moe_out = moe_apply(
-            layer,
-            x_TD,
-            router_logits,
-            weights,
-            layer.moe_backend,
-            layer.mesh,
-            self.extra_backend_kwargs,
-            capture_ep_ragged_a2a=capture_ep_ragged,
-        )
+        if layer.moe_backend == MoEBackend.MEGABLX_GMM:
+            moe_out = moe_apply(
+                layer,
+                x_TD,
+                router_logits,
+                weights,
+                layer.moe_backend,
+                layer.mesh,
+                self.extra_backend_kwargs,
+                capture_ep_ragged_a2a=capture_ep_ragged,
+            )
+        else:
+            with tpu_trace_region("moe_kernel"):
+                moe_out = moe_apply(
+                    layer,
+                    x_TD,
+                    router_logits,
+                    weights,
+                    layer.moe_backend,
+                    layer.mesh,
+                    self.extra_backend_kwargs,
+                    capture_ep_ragged_a2a=capture_ep_ragged,
+                )
         if capture_ep_ragged and isinstance(moe_out, tuple):
             output, ep_extra = moe_out
             routing_stats = {**routing_stats, **ep_extra}
