@@ -3,6 +3,7 @@
 import math
 import os
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Tuple
 
@@ -151,6 +152,12 @@ class TPUWorker(WorkerBase):
 
         # True only between a successful jax.profiler.start_trace and stop_trace.
         self._jax_profiler_trace_active = False
+        # /start_profile can run on the API thread; JAX requires start/stop on the
+        # thread that runs the program (here: execute_model). These flags defer
+        # until the next model step (see _apply_pending_jax_profiler_trace).
+        self._jax_profiler_lock = threading.Lock()
+        self._jax_profiler_start_pending = False
+        self._jax_profiler_stop_pending = False
 
         use_jax_profiler_server = os.getenv("USE_JAX_PROFILER_SERVER", False)
         # Only one instance of profiler is allowed
@@ -372,6 +379,31 @@ class TPUWorker(WorkerBase):
                              f"{gpu_memory_utilization} to a larger value.")
         return total_hbm_avail
 
+    def _apply_pending_jax_profiler_trace(self) -> None:
+        """Apply deferred jax.profiler start/stop on the execute_model thread."""
+        with self._jax_profiler_lock:
+            if self._jax_profiler_stop_pending:
+                self._jax_profiler_stop_pending = False
+                if self._jax_profiler_trace_active:
+                    jax.profiler.stop_trace()
+                    self._jax_profiler_trace_active = False
+            if self._jax_profiler_start_pending:
+                self._jax_profiler_start_pending = False
+                if self._jax_profiler_trace_active or not self.profile_dir:
+                    return
+                os.makedirs(self.profile_dir, exist_ok=True)
+                options = jax.profiler.ProfileOptions()
+                options.python_tracer_level = envs.PYTHON_TRACER_LEVEL
+                options.host_tracer_level = int(
+                    os.getenv("HOST_TRACER_LEVEL", "1"))
+                perfetto = envs.JAX_PROFILER_CREATE_PERFETTO_TRACE
+                jax.profiler.start_trace(
+                    self.profile_dir,
+                    create_perfetto_trace=perfetto,
+                    profiler_options=options,
+                )
+                self._jax_profiler_trace_active = True
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -380,6 +412,8 @@ class TPUWorker(WorkerBase):
         # violates the pure abstract contract of the base class. This is a
         # deliberate, temporary compromise for the same reasons outlined in
         # the `get_kv_cache_spec` method.
+
+        self._apply_pending_jax_profiler_trace()
 
         if self.parallel_config.pipeline_parallel_size == 1 or self.rank == 0:
             intermediate_tensors = None
@@ -432,6 +466,12 @@ class TPUWorker(WorkerBase):
         always labeled literally in Chrome JSON. Requires ``profiler_config.profiler ==
         "torch"`` and ``torch_profiler_dir`` so ``self.profile_dir`` is set
         (see ``examples/tpu_profiling.py``).
+
+        ``jax.profiler.start_trace`` / ``stop_trace`` are applied at the
+        **beginning of the next** ``execute_model`` call so they run on the same
+        thread as JAX work. This avoids ``External init callback must run in
+        same thread as registerClient`` when vLLM's HTTP ``/start_profile`` is
+        handled on the API process thread.
         """
         if is_start:
             if not self.profile_dir:
@@ -439,27 +479,29 @@ class TPUWorker(WorkerBase):
                     "profile(start) skipped: no JAX trace directory "
                     "(set vLLM profiler to torch with torch_profiler_dir).")
                 return
+            with self._jax_profiler_lock:
+                if self._jax_profiler_trace_active:
+                    logger.warning(
+                        "profile(start) skipped: JAX profiler trace already active."
+                    )
+                    return
+                if self._jax_profiler_start_pending:
+                    logger.warning(
+                        "profile(start) skipped: start already scheduled for "
+                        "next model step.")
+                    return
+                self._jax_profiler_start_pending = True
+            logger.info(
+                "JAX profiler start scheduled for next model step (EngineCore "
+                "execute_model thread).")
+            return
+
+        with self._jax_profiler_lock:
+            self._jax_profiler_start_pending = False
             if self._jax_profiler_trace_active:
-                logger.warning(
-                    "profile(start) skipped: JAX profiler trace already active.")
-                return
-            os.makedirs(self.profile_dir, exist_ok=True)
-            options = jax.profiler.ProfileOptions()
-            # default: https://docs.jax.dev/en/latest/profiling.html#general-options
-            options.python_tracer_level = envs.PYTHON_TRACER_LEVEL
-            options.host_tracer_level = int(os.getenv("HOST_TRACER_LEVEL", "1"))
-            perfetto = envs.JAX_PROFILER_CREATE_PERFETTO_TRACE
-            jax.profiler.start_trace(
-                self.profile_dir,
-                create_perfetto_trace=perfetto,
-                profiler_options=options,
-            )
-            self._jax_profiler_trace_active = True
-        else:
-            if not self._jax_profiler_trace_active:
-                return
-            jax.profiler.stop_trace()
-            self._jax_profiler_trace_active = False
+                self._jax_profiler_stop_pending = True
+            elif self._jax_profiler_stop_pending:
+                self._jax_profiler_stop_pending = False
 
     def load_model(self) -> None:
         self.model_runner.load_model()

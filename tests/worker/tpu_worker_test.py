@@ -333,7 +333,7 @@ class TestTPUWorker:
     @patch('tpu_inference.worker.tpu_worker.jax')
     @patch.dict('os.environ', {"PYTHON_TRACER_LEVEL": "1"}, clear=True)
     def test_profile_start(self, mock_jax, mock_vllm_config):
-        """Tests starting the JAX profiler."""
+        """Tests starting the JAX profiler (deferred until execute_model thread)."""
         worker = TPUWorker(vllm_config=mock_vllm_config,
                            local_rank=0,
                            rank=0,
@@ -341,6 +341,9 @@ class TestTPUWorker:
         worker.profile_dir = "/tmp/profile_dir"
 
         worker.profile(is_start=True)
+        mock_jax.profiler.start_trace.assert_not_called()
+
+        worker._apply_pending_jax_profiler_trace()
 
         mock_jax.profiler.ProfileOptions.assert_called_once()
         mock_jax.profiler.start_trace.assert_called_once()
@@ -352,14 +355,19 @@ class TestTPUWorker:
 
     @patch('tpu_inference.worker.tpu_worker.jax')
     def test_profile_stop(self, mock_jax, mock_vllm_config):
-        """Tests stopping the JAX profiler."""
+        """Tests stopping the JAX profiler (stop deferred like start)."""
         worker = TPUWorker(vllm_config=mock_vllm_config,
                            local_rank=0,
                            rank=0,
                            distributed_init_method="test")
         worker.profile_dir = "/tmp/profile_dir"
         worker.profile(is_start=True)
+        worker._apply_pending_jax_profiler_trace()
+        mock_jax.profiler.start_trace.assert_called_once()
+
         worker.profile(is_start=False)
+        mock_jax.profiler.stop_trace.assert_not_called()
+        worker._apply_pending_jax_profiler_trace()
         mock_jax.profiler.stop_trace.assert_called_once()
 
     def test_profile_start_skipped_without_profile_dir(self, mock_vllm_config):

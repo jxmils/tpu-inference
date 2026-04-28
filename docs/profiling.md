@@ -58,6 +58,18 @@ python3 examples/tpu_profiling.py \
   --batch-size 256
 ```
 
+## vLLM HTTP `POST /start_profile` on TPU
+
+vLLM’s OpenAI server can call `TPUWorker.profile()` from the API process thread,
+while JAX expects `jax.profiler.start_trace` / `stop_trace` on the same thread
+that runs compiled work. **tpu-inference defers** start/stop to the **next**
+`execute_model` step on the worker so `POST /start_profile` and
+`POST /stop_profile` remain valid after you configure a trace directory (for
+example `--profiler-config` with `profiler: torch` and `torch_profiler_dir`, as
+in `examples/tpu_profiling.py`). For capture without HTTP, prefer
+`--profiler-config`, phased profiling (`PHASED_PROFILING_DIR` below), or
+`USE_JAX_PROFILER_SERVER`.
+
 ## XLA HLO dumps (buffer assignment, activations, KV)
 
 To inspect XLA memory plans and buffer sizes (including large activations and
